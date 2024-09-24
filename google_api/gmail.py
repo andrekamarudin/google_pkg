@@ -22,9 +22,9 @@ from pydantic import BaseModel
 
 
 class Criteria(Enum):
-    SENDER: str = {"operator": "from", "property": "sent_from"}
-    SUBJECT: str = {"operator": "subject", "property": "subject"}
-    THREAD_ID: str = {"operator": "thread_id", "property": "thread_id"}
+    SENDER = {"operator": "from", "property": "sent_from"}
+    SUBJECT = {"operator": "subject", "property": "subject"}
+    THREAD_ID = {"operator": "thread_id", "property": "thread_id"}
 
 
 class EmailHeaders(BaseModel):
@@ -52,11 +52,11 @@ class EmailHeaders(BaseModel):
 
 
 class Label(Enum):
-    INBOX: str = "INBOX"
-    SPAM: str = "SPAM"
-    TRASH: str = "TRASH"
-    UNREAD: str = "UNREAD"
-    TTD: str = "Label_1833152009763122946"
+    INBOX = "INBOX"
+    SPAM = "SPAM"
+    TRASH = "TRASH"
+    UNREAD = "UNREAD"
+    TTD = "Label_1833152009763122946"
 
 
 @dataclass
@@ -67,22 +67,14 @@ class GmailService(GService):
             for action in ["readonly", "modify", "send"]
         ]
     )
-    sa_json_name: str = ""
-    sa_json_folder: Path = ""
     cred_file_folder: Path = Path(os.getenv("USERPROFILE"))
-    cred_file_name: str = "my_cred_file.json"
     pickle_name: str = "gmail_token.pickle"
 
     def __post_init__(self, service_key: Optional[ServiceKey] = None) -> None:
         self.user_id: str = "me"
-        self.cred_file = self.cred_file_folder / self.cred_file_name
         self.token_pickle = self.cred_file_folder / self.pickle_name
-        super().__init__(
-            sa_json_name=self.sa_json_name,
-            sa_json_folder=self.sa_json_folder,
-            service_key=service_key,
-        )
-        self._build_service(
+        super().__init__(service_key=service_key)
+        self.build_service(
             scopes=self.SCOPES,
             short_name="gmail",
             version="v1",
@@ -107,7 +99,7 @@ class GmailService(GService):
                 creds = None  # Set creds to None to trigger re-authentication
         if not creds or not creds.valid:
             flow = InstalledAppFlow.from_client_secrets_file(
-                self.cred_file, scopes or self.SCOPES
+                self.service_key_path, scopes or self.SCOPES
             )
             creds = flow.run_local_server(port=0)
 

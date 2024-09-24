@@ -6,7 +6,6 @@ from typing import Optional
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from icecream import ic
 from loguru import logger
 from pydantic import BaseModel
 
@@ -37,6 +36,15 @@ class GService:
     ):
         logger.info("Initializing GService")
 
+        if isinstance(service_key_path, str | Path):
+            self.service_key_path: Path = (
+                Path(service_key_path)
+                if isinstance(service_key_path, str)
+                else service_key_path
+            )
+        else:
+            self.service_key_path = None
+
         if isinstance(service_key, ServiceKey):
             service_key_checked: ServiceKey = service_key
         elif isinstance(service_key, dict):
@@ -45,16 +53,24 @@ class GService:
             service_key_checked: ServiceKey = ServiceKey(
                 **json.loads(Path(service_key_path).read_text())
             )
+
         elif isinstance(service_key_path, Path) and service_key_path.exists():
             service_key_checked: ServiceKey = ServiceKey(
                 **json.loads(service_key_path.read_text())
             )
+            self.service_key_path = service_key_path
         elif GOOGLE_APPLICATION_CREDENTIALS := os.environ.get(
             "DBDA_GOOGLE_APPLICATION_CREDENTIALS"
         ) or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
-            service_key_checked: ServiceKey = ServiceKey(
-                **json.loads(Path(GOOGLE_APPLICATION_CREDENTIALS).read_text())
-            )
+            self.service_key_path: Path = Path(GOOGLE_APPLICATION_CREDENTIALS)
+            if self.service_key_path.exists():
+                service_key_checked: ServiceKey = ServiceKey(
+                    **json.loads(self.service_key_path.read_text())
+                )
+            else:
+                raise Exception(
+                    f"Provided Service account JSON file path does not exist: {self.service_key_path}"
+                )
         else:
             raise Exception(
                 "Service account JSON file not found in system or environment variables"

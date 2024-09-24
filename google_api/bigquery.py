@@ -1,9 +1,10 @@
-import json
 import os
+import platform
 import sys
 import time
+from functools import partialmethod
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 import pandas as pd
 from colorama import Fore, Style
@@ -27,7 +28,7 @@ class BigQuery:
         """
         Ensure singleton instance of BigQuery class for a given project.
         """
-        project = project or os.getenv("BIGQUERY_DEFAULT_PROJECT") 
+        project = project or os.getenv("BIGQUERY_DEFAULT_PROJECT")
         if project in cls._instances:
             return cls._instances[project]
         else:
@@ -44,19 +45,21 @@ class BigQuery:
     ):
         self.project = project or os.getenv("BIGQUERY_DEFAULT_PROJECT")
         if not self.project:
-            raise Exception("Project not specified nor found in environment variables") 
+            raise Exception("Project not specified nor found in environment variables")
         if hasattr(self, "initialized"):
             logger.info(
                 f"{self.__class__.__name__} already initialized for {self.project}"
             )
             return
         self.initialized = True
-        
+
         logger.info(f"Initializing {self.__class__.__name__} for {self.project}")
 
-        if self.project == "fairprice-bigquery" and not service_key_path:
+        if service_key_path:
+            pass
+        elif self.project == "fairprice-bigquery":
             service_key_path = os.getenv("DBDA_GOOGLE_APPLICATION_CREDENTIALS")
-        elif self.project == "andrekamarudin" and not service_key_path:
+        elif self.project == "andrekamarudin":
             service_key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         self.bq_service = BigQueryService(
             self,
@@ -67,13 +70,60 @@ class BigQuery:
         )
         self.client = self.bq_service.client
 
-    def q(self, sql: str, project: Optional[str] = None) -> pd.DataFrame:
+    def beep(self, frequency: int, duration: int):
+        if not self.completion_alert:
+            return
+        if hasattr(self, "_beep"):
+            pass
+        elif platform.system() == "Windows":
+            import winsound
+
+            self._beep = winsound.Beep
+
+        elif platform.system() == "Darwin":
+            self._beep = lambda *args, **kwargs: os.system('say "beep"')
+        else:
+            self._beep = lambda *args, **kwargs: None
+
+        return self._beep(frequency, duration)
+
+    def q(
+        self,
+        sql: str,
+        project: Optional[str] = None,
+        preview_rows: Optional[int] = None,
+        completion_alert: bool = False,
+    ) -> pd.DataFrame:
         project = project or self.project
-        df = self.client.query(sql).to_dataframe()
-        logger.info(
-            f"Query executed: {df.shape[0]} rows and {df.shape[1]} columns; {df.memory_usage(deep=True).sum() / 1e6} MB"
-        )
-        return df
+        self.completion_alert = completion_alert
+
+        job: bigquery.QueryJob = self.client.query(sql)
+
+        if job.ddl_target_table:
+            logger.success(
+                f"{job.ddl_operation_performed} done to {job.ddl_target_table};\n"
+            )
+        elif job.dml_stats:
+            logger.success(
+                f"Deleted {job.dml_stats.deleted_row_count} row(s)\n"
+                if job.dml_stats.deleted_row_count
+                else f"Inserted {job.dml_stats.inserted_row_count} row(s)\n"
+                if job.dml_stats.inserted_row_count
+                else f"Updated {job.dml_stats.updated_row_count} row(s)\n"
+                if job.dml_stats.updated_row_count
+                else "No rows affected"
+            )
+
+        job_result: Iterator = job.result()
+        row_cnt = job_result.total_rows
+        if row_cnt:
+            logger.success(f"Query returned {row_cnt} rows")
+        else:
+            logger.success("Query completed without returning any rows")
+        self.beep(440, 300)
+        return job_result.to_dataframe()
+
+    qq = partialmethod(q, completion_alert=True, preview_rows=5)
 
     def upload_df_to_bq(
         self,
@@ -110,7 +160,7 @@ class BigQuery:
     def get_schema(
         self, df: pd.DataFrame, specify_dtypes: bool
     ) -> list[bigquery.SchemaField] | None:
-        logger.warning("Attempting to infer schema from DataFrame")
+        logger.info("Attempting to infer schema from DataFrame")
         if specify_dtypes:
             column_names = df.columns.tolist()
             common_dtypes = [
@@ -147,7 +197,7 @@ class BigQuery:
             return schema
         else:
             schema = None
-            logger.warning("No schema inferred")
+            logger.info("No schema inferred")
             return schema
 
     def drop_dataset(self, dataset_id: str, project: Optional[str] = None) -> None:
@@ -167,9 +217,64 @@ class BigQuery:
         )
         return
 
+    def q_database_index(
+        self,
+        column_keyword: Optional[str] = None,
+        dataset_keyword: Optional[str] = None,
+        table_keyword: Optional[str] = None,
+    ) -> pd.DataFrame:
+        if not column_keyword and not dataset_keyword and not table_keyword:
+            raise ValueError("At least one keyword must be provided.")
+        col_filter = (
+            f"AND REGEXP_CONTAINS(column_name,r'(?i){column_keyword}')"
+            if column_keyword
+            else ""
+        )
+        dataset_filter = (
+            f"AND REGEXP_CONTAINS(table_schema,r'(?i){dataset_keyword}')"
+            if dataset_keyword
+            else ""
+        )
+        table_filter = (
+            f"AND REGEXP_CONTAINS(table_name,r'(?i){table_keyword}')"
+            if table_keyword
+            else ""
+        )
+        results = self.q(f"""
+            SELECT DISTINCT  table_id, column_name, data_type
+            FROM ads_dbda.db_database_index
+            WHERE 1=1 
+            {col_filter}
+            {dataset_filter}
+            {table_filter}
+            ORDER BY 1,2,3
+        """)
+        return results
+
+    def q_last_modified(
+        self,
+        table_id: str,
+        dataset_id: str,
+        project: Optional[str] = None,
+    ) -> pd.Timestamp:
+        project = project or self.project
+        results = self.q(f"""
+        SELECT TIMESTAMP_MILLIS(last_modified_time) AS last_modified
+        FROM `{project}.{dataset_id}.__TABLES__`,
+        UNNEST([table_id = "{table_id}"]) AS is_exact_match,
+        UNNEST([table_id LIKE "{table_id}%"]) AS is_like_match
+        WHERE 1=1 
+            AND is_like_match
+        ORDER BY is_exact_match DESC, last_modified DESC
+        LIMIT 1
+        """)
+        if results.empty:
+            logger.warning(f"No results found for table {table_id}")
+        return results["last_modified"][0]
+
     def list_table_by_keyword(
         self,
-        keyword: str,
+        keyword: Optional[str] = None,
         dataset_id: Optional[str] = None,
         project: Optional[str] = None,
     ) -> list:
@@ -184,7 +289,9 @@ class BigQuery:
                 dataset_ref = self.client.dataset(dataset.dataset_id, project)
                 tables += list(self.client.list_tables(dataset_ref))
         table_names = [
-            table.full_table_id for table in tables if keyword in table.table_id
+            table.full_table_id
+            for table in tables
+            if not keyword or keyword in table.table_id
         ]
         logger.success(f"{len(table_names)} tables found.")
         return table_names
@@ -315,12 +422,8 @@ class BigQueryService:
 
 
 def main():
-    sa_path = Path(
-        r"C:\Users\andre\AppData\Roaming\Andre\dbda_google_service_account.json"
-    )
-    service_key = ServiceKey(**json.loads(sa_path.read_text()))
-    bq = BigQuery(project="fairprice-bigquery", service_key=service_key)
-    print(bq.q("SELECT * FROM dev_dbda.calendar_full").to_markdown())
+    bq = BigQuery(project="fairprice-bigquery")
+    print(bq.q("SELECT current_date('+8') as date").to_markdown())
 
 
 if __name__ == "__main__":
