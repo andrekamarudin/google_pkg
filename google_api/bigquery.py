@@ -36,7 +36,7 @@ class BigQuery:
         self,
         project=None,
         location=None,
-        service_key_path: Optional[Path] = None,
+        service_key_path: Optional[Path | str] = None,
         service_key: Optional[ServiceKey] = None,
     ):
         if hasattr(self, "initialized"):
@@ -211,7 +211,7 @@ class BigQueryService:
         bq_wrapper: BigQuery,
         project: Optional[str] = None,
         location: Optional[str] = None,
-        service_key_path: Optional[Path] = None,
+        service_key_path: Optional[Path | str] = None,
         service_key: Optional[ServiceKey] = None,
     ):
         if hasattr(self, "initialized"):

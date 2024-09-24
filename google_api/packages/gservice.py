@@ -33,7 +33,7 @@ class GService:
     def __init__(
         self,
         service_key: Optional[ServiceKey | dict] = None,
-        service_key_path: Optional[Path] = None,
+        service_key_path: Optional[Path | str] = None,
     ):
         logger.info("Initializing GService")
 
@@ -42,7 +42,11 @@ class GService:
             service_key_checked: ServiceKey = service_key
         elif isinstance(service_key, dict):
             service_key_checked: ServiceKey = ServiceKey(**service_key)
-        elif service_key_path and service_key_path.exists():
+        elif isinstance(service_key_path, str) and Path(service_key_path).exists():
+            service_key_checked: ServiceKey = ServiceKey(
+                **json.loads(Path(service_key_path).read_text())
+            )
+        elif isinstance(service_key_path, Path) and service_key_path.exists():
             service_key_checked: ServiceKey = ServiceKey(
                 **json.loads(service_key_path.read_text())
             )
