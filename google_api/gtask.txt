@@ -1,0 +1,88 @@
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+import os
+
+
+
+class GTask:
+    """
+    Google Task API
+
+    This class provides methods to interact with the Google Tasks API.
+    It allows you to retrieve task lists and tasks from Google Tasks.
+    This class provides methods to interact with the Google Tasks API.
+    It allows you to retrieve task lists and tasks from Google Tasks.
+
+    Usage:
+    1. Instantiate the GTask class.
+    2. Call the `get_task_lists()` method to retrieve a dictionary of task lists.
+    3. Call the `get_tasks(task_list_id)` method to retrieve a dictionary of tasks for a specific task list.
+
+    For more information, refer to the Google Tasks API documentation: https://developers.google.com/apps-script/advanced/tasks
+    """
+
+    credentials = service_account.Credentials.from_service_account_info(
+        speechgpt["service_account"],
+        scopes=["https://www.googleapis.com/auth/tasks"],
+    )
+    service = build("tasks", "v1", credentials=credentials)
+
+    def get_task_lists():
+        """
+        Retrieves a dictionary of task lists from Google Tasks.
+
+        Returns:
+        - task_lists (dict): A dictionary where the keys are the task list titles and the values are the task list IDs.
+
+        Raises:
+        - Exception: If an error occurs while retrieving the task lists.
+        """
+        try:
+            results = service.tasklists().list(maxResults=10).execute()
+            items = results.get("items", [])
+            print("No task lists found.") if not items else None
+            # create dict
+            task_lists = {}
+            for item in items:
+                task_lists[item["title"]] = item["id"]
+            return task_lists
+        except Exception as err:
+            print(err)
+
+
+    def get_tasks(task_list_id):
+        """
+        Retrieves a dictionary of tasks from a specified task list.
+
+        Args:
+            task_list_id (str): The ID of the task list.
+
+        Returns:
+            dict: A dictionary where the keys are task titles and the values are task IDs.
+                  Returns an empty dictionary if no tasks are found.
+
+        Raises:
+            Exception: If an error occurs while retrieving the tasks.
+        """
+        try:
+            results = service.tasks().list(tasklist=task_list_id).execute()
+            items = results.get("items", [])
+            if not items:
+                print("No tasks found.")
+                return
+            # create dict
+            tasks = {}
+            for item in items:
+                tasks[item["title"]] = item["id"]
+            return tasks
+        except Exception as err:
+            print(err)
+
+
+if __name__ == "__main__":
+    os.system("cls")
+    task_lists = get_task_lists()
+    print(task_lists)
+    for i in task_lists.values():
+        tasks = get_tasks(i)
+    print(tasks)
