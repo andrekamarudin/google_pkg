@@ -15,6 +15,10 @@ from tqdm import tqdm
 
 from google_api.packages.gservice import GService, ServiceKey
 
+logger.remove()
+LOG_FMT = "<level>{level}: {message}</level> <black>({file} / {module} / {function} / {line})</black>"
+logger.add(sys.stdout, level="SUCCESS", format=LOG_FMT)
+
 
 class BigQuery:
     _instances = {}
@@ -23,7 +27,7 @@ class BigQuery:
         """
         Ensure singleton instance of BigQuery class for a given project.
         """
-        project = project or "andrekamarudin"
+        project = project or os.getenv("BIGQUERY_DEFAULT_PROJECT") 
         if project in cls._instances:
             return cls._instances[project]
         else:
@@ -38,14 +42,22 @@ class BigQuery:
         service_key_path: Optional[Path | str] = None,
         service_key: Optional[ServiceKey] = None,
     ):
+        self.project = project or os.getenv("BIGQUERY_DEFAULT_PROJECT")
+        if not self.project:
+            raise Exception("Project not specified nor found in environment variables") 
         if hasattr(self, "initialized"):
             logger.info(
                 f"{self.__class__.__name__} already initialized for {self.project}"
             )
             return
         self.initialized = True
-        self.project = project or "andrekamarudin"
+        
         logger.info(f"Initializing {self.__class__.__name__} for {self.project}")
+
+        if self.project == "fairprice-bigquery" and not service_key_path:
+            service_key_path = os.getenv("DBDA_GOOGLE_APPLICATION_CREDENTIALS")
+        elif self.project == "andrekamarudin" and not service_key_path:
+            service_key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         self.bq_service = BigQueryService(
             self,
             project=project,
@@ -214,13 +226,13 @@ class BigQueryService:
         service_key_path: Optional[Path | str] = None,
         service_key: Optional[ServiceKey] = None,
     ):
+        self.project = project or os.getenv("BIGQUERY_DEFAULT_PROJECT")
         if hasattr(self, "initialized"):
             logger.info(
                 f"{self.__class__.__name__} already initialized for {self.project}"
             )
             return
         self.initialized = True
-        self.project = project or "andrekamarudin"
         self.location = location or "asia-southeast1"
         self.bq_wrapper = bq_wrapper
         self.SCOPES = ["https://www.googleapis.com/auth/bigquery"]
@@ -312,6 +324,4 @@ def main():
 
 
 if __name__ == "__main__":
-    logger.remove()
-    logger.add(sys.stderr, level="SUCCESS")
     main()

@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "google-api"
-version = "1.02"
+version = "1.05"
 description = "Package to interact with various Google APIs"
 authors = ["Andre <andre.kamarudin@fairprice.com.sg>"]
 readme = "README.md"
