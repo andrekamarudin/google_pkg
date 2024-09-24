@@ -37,7 +37,6 @@ class GService:
     ):
         logger.info("Initializing GService")
 
-        service_key_checked = None
         if isinstance(service_key, ServiceKey):
             service_key_checked: ServiceKey = service_key
         elif isinstance(service_key, dict):
@@ -51,19 +50,19 @@ class GService:
                 **json.loads(service_key_path.read_text())
             )
         elif GOOGLE_APPLICATION_CREDENTIALS := os.environ.get(
-            "GOOGLE_APPLICATION_CREDENTIALS"
-        ):
+            "DBDA_GOOGLE_APPLICATION_CREDENTIALS"
+        ) or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
             service_key_checked: ServiceKey = ServiceKey(
                 **json.loads(Path(GOOGLE_APPLICATION_CREDENTIALS).read_text())
             )
-
-        if service_key_checked and (isinstance(service_key_checked, ServiceKey)):
-            self.sa_info: dict = service_key_checked.model_dump()
-            logger.success("Initialized GService")
         else:
             raise Exception(
                 "Service account JSON file not found in system or environment variables"
             )
+
+        if isinstance(service_key_checked, ServiceKey):
+            self.sa_info: dict = service_key_checked.model_dump()
+            logger.success("Initialized GService")
 
     def build_service(self, scopes, short_name, version, credentials=None):
         self.credentials = (

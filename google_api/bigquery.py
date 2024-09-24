@@ -10,7 +10,6 @@ from colorama import Fore, Style
 from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 from google.oauth2 import service_account
-from icecream import ic
 from loguru import logger
 from tqdm import tqdm
 
@@ -98,7 +97,7 @@ class BigQuery:
 
     def get_schema(
         self, df: pd.DataFrame, specify_dtypes: bool
-    ) -> list[bigquery.SchemaField]:
+    ) -> list[bigquery.SchemaField] | None:
         logger.warning("Attempting to infer schema from DataFrame")
         if specify_dtypes:
             column_names = df.columns.tolist()
@@ -133,10 +132,11 @@ class BigQuery:
                 for name, dtype in column_dtypes.items()
             ]
             logger.success(f"Schema inferred successfully: {schema}")
+            return schema
         else:
             schema = None
             logger.warning("No schema inferred")
-        return schema
+            return schema
 
     def drop_dataset(self, dataset_id: str, project: Optional[str] = None) -> None:
         project = project or self.project
