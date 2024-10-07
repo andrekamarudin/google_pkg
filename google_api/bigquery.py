@@ -6,6 +6,7 @@ import warnings
 from pathlib import Path
 from typing import Iterator, Optional
 
+import numpy as np
 import pandas as pd
 from colorama import Fore, Style
 from google.api_core.exceptions import NotFound
@@ -134,7 +135,9 @@ class BigQuery:
                 output_row_cnt = self.q(
                     f"SELECT count(*) FROM {temp_table}", is_checking_row_cnt=True
                 ).iloc[0, 0]
-                assert isinstance(output_row_cnt, int)
+                assert isinstance(
+                    output_row_cnt, np.int64
+                ), f"Unexpected {type(output_row_cnt)=}. Expected int."
                 if row_limit and output_row_cnt > row_limit:
                     return pd.DataFrame(
                         [
