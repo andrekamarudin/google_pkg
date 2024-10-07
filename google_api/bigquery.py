@@ -2,7 +2,7 @@ import os
 import platform
 import sys
 import time
-from functools import partialmethod
+import warnings
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -15,6 +15,13 @@ from loguru import logger
 from tqdm import tqdm
 
 from google_api.packages.gservice import GService, ServiceKey
+
+warnings.filterwarnings(
+    "ignore",
+    message="BigQuery Storage module not found, fetch data with the REST endpoint instead.",
+    category=UserWarning,
+    module="google.cloud.bigquery.table",
+)
 
 logger.remove()
 LOG_FMT = "<level>{level}: {message}</level> <black>({file} / {module} / {function} / {line})</black>"
@@ -59,7 +66,7 @@ class BigQuery:
             pass
         elif self.project == "fairprice-bigquery":
             service_key_path = os.getenv("DBDA_GOOGLE_APPLICATION_CREDENTIALS")
-        elif self.project == "andrekamarudin":
+        else:
             service_key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         self.bq_service = BigQueryService(
             self,
@@ -91,8 +98,9 @@ class BigQuery:
         self,
         sql: str,
         project: Optional[str] = None,
-        preview_rows: Optional[int] = None,
+        row_limit: Optional[int] = 500,
         completion_alert: bool = False,
+        is_checking_row_cnt: bool = False,
     ) -> pd.DataFrame:
         project = project or self.project
         self.completion_alert = completion_alert
@@ -113,17 +121,36 @@ class BigQuery:
                 if job.dml_stats.updated_row_count
                 else "No rows affected"
             )
-
         job_result: Iterator = job.result()
-        row_cnt = job_result.total_rows
-        if row_cnt:
-            logger.success(f"Query returned {row_cnt} rows")
+        if is_checking_row_cnt:
+            pass
+        # get row count from job_result
+        elif output_row_cnt := job_result.total_rows:
+            logger.success(f"Query returned {output_row_cnt:,.0f} rows")
         else:
             logger.success("Query completed without returning any rows")
+
+        if job.destination and not is_checking_row_cnt:
+            # get temp table name
+            temp_table = f"{job.destination.dataset_id}.{job.destination.table_id}"
+            logger.success(f"Query result stored in {temp_table}")
+            output_row_cnt = self.q(
+                f"SELECT count(*) FROM {temp_table}", is_checking_row_cnt=True
+            ).iloc[0, 0]
+
+        # get row count from temp table
+        if not is_checking_row_cnt:
+            if row_limit and output_row_cnt > row_limit:
+                return pd.DataFrame(
+                    [
+                        {
+                            "row_limit_exceeded": f"{output_row_cnt=:,.0f} exceeds {row_limit=:,.0f}"
+                        }
+                    ]
+                )
+
         self.beep(440, 300)
         return job_result.to_dataframe()
-
-    qq = partialmethod(q, completion_alert=True, preview_rows=5)
 
     def upload_df_to_bq(
         self,
@@ -200,6 +227,59 @@ class BigQuery:
             logger.info("No schema inferred")
             return schema
 
+    def see_query_example(
+        self,
+        table_name: str,
+        dataset_name: str,
+        keywords: Optional[str] = None,
+        row_cnt: int = 5,
+        min_run: int = 5,
+        dbda_only: bool = True,
+        is_nested: bool = False,
+    ) -> list[str]:
+        keywords_filter = (
+            f'and regexp_contains(query,r"(?i){keywords}")' if keywords else ""
+        )
+        dbda_filter = (
+            (
+                'AND ( regexp_contains(user,r"(?i)db-airflow") or regexp_contains(user_grp,r"(?i)dbda") )'
+            )
+            if dbda_only
+            else ""
+        )
+        df = self.q(
+            rf"""
+            SELECT DISTINCT 
+                query,
+                COUNT(*) as cnt
+            FROM dev_dbda.bq_query_history_analysis
+            WHERE 1=1 
+            AND (
+                regexp_contains(referenced_tables,r"(?i){dataset_name}.{table_name}")
+                or regexp_contains(destination_table,r"(?i){dataset_name}.{table_name}")
+            )
+            AND regexp_contains(job_type_level2,r"(?i)scheduled_query|script_job")
+            {dbda_filter}
+            {keywords_filter}
+            GROUP BY All having cnt >= {min_run} 
+            ORDER BY cnt DESC limit {row_cnt}
+        """
+        )
+        if df.empty and not is_nested:
+            return self.see_query_example(
+                table_name=table_name,
+                dataset_name=dataset_name,
+                keywords=keywords,
+                row_cnt=row_cnt,
+                min_run=1,
+                dbda_only=False,
+                is_nested=True,
+            )
+
+        query_list = df["query"].tolist()
+
+        return query_list
+
     def drop_dataset(self, dataset_id: str, project: Optional[str] = None) -> None:
         project = project or self.project
         self.client.delete_dataset(dataset_id, delete_contents=True, not_found_ok=True)
@@ -220,11 +300,15 @@ class BigQuery:
     def q_database_index(
         self,
         column_keyword: Optional[str] = None,
-        dataset_keyword: Optional[str] = None,
         table_keyword: Optional[str] = None,
+        dataset_keyword: Optional[str] = None,
     ) -> pd.DataFrame:
-        if not column_keyword and not dataset_keyword and not table_keyword:
-            raise ValueError("At least one keyword must be provided.")
+        assert (
+            self.project == "fairprice-bigquery"
+        ), "Not implemented for projects other than fairprice-bigquery."
+        assert (
+            column_keyword or dataset_keyword or table_keyword
+        ), "At least one keyword must be provided."
         col_filter = (
             f"AND REGEXP_CONTAINS(column_name,r'(?i){column_keyword}')"
             if column_keyword
@@ -240,15 +324,63 @@ class BigQuery:
             if table_keyword
             else ""
         )
-        results = self.q(f"""
-            SELECT DISTINCT  table_id, column_name, data_type
+        results = self.q(
+            f"""
+            SELECT DISTINCT  
+                table_id, 
+                column_name,
+                is_partitioning_column,
+                data_type,
+                # clustering_ordinal_position,
             FROM ads_dbda.db_database_index
             WHERE 1=1 
             {col_filter}
             {dataset_filter}
             {table_filter}
             ORDER BY 1,2,3
-        """)
+        """
+        )
+        return results
+
+    def get_table_sample_rows(
+        self,
+        table_keyword: str,
+        dataset_keyword: Optional[str] = None,
+    ) -> dict[str, pd.DataFrame]:
+        assert (
+            self.project == "fairprice-bigquery"
+        ), "Not implemented for projects other than fairprice-bigquery."
+        metadata = self.q_database_index(
+            table_keyword=table_keyword,
+            dataset_keyword=dataset_keyword,
+        )
+        unique_table_ids = set(metadata["table_id"])
+        assert len(unique_table_ids) <= 3, f"Too many tables found: {unique_table_ids}"
+        table_partition_col_mapping: dict[str, list[str]] = {}
+        for table_id in unique_table_ids:
+            partitions = metadata[
+                (metadata["table_id"] == table_id)
+                & (metadata["is_partitioning_column"])
+            ]
+            table_partition_col_mapping[table_id] = partitions["column_name"].tolist()
+
+        results = {}
+        for table_id in unique_table_ids:
+            first_partition_col = table_partition_col_mapping[table_id][0]
+            max_partition = self.q(
+                rf"""
+                SELECT MAX({first_partition_col}) AS max_partition
+                FROM `{table_id}`
+                """
+            ).iloc[0]["max_partition"]
+            df = self.q(
+                f"""
+            SELECT * FROM `{table_id}`
+            where concat({first_partition_col}) = '{max_partition}'
+            limit 5
+            """
+            )
+            results[table_id] = df.to_markdown()
         return results
 
     def q_last_modified(
