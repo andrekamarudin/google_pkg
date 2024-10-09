@@ -6,7 +6,6 @@ import warnings
 from pathlib import Path
 from typing import Iterator, Optional
 
-import numpy as np
 import pandas as pd
 from colorama import Fore, Style
 from google.api_core.exceptions import NotFound
@@ -123,31 +122,32 @@ class BigQuery:
                 else "No rows affected"
             )
         job_result: Iterator = job.result()
-        if output_row_cnt := job_result.total_rows:
-            logger.success(f"Query returned {output_row_cnt} rows")
+        if is_checking_row_cnt:
+            pass
+        # get row count from job_result
+        elif output_row_cnt := job_result.total_rows:
+            logger.success(f"Query returned {output_row_cnt:,.0f} rows")
         else:
             logger.success("Query completed without returning any rows")
 
         if job.destination and not is_checking_row_cnt:
-            try:
-                temp_table = f"{job.destination.dataset_id}.{job.destination.table_id}"
-                logger.success(f"Query result stored in {temp_table}")
-                output_row_cnt = self.q(
-                    f"SELECT count(*) FROM {temp_table}", is_checking_row_cnt=True
-                ).iloc[0, 0]
-                assert isinstance(
-                    output_row_cnt, np.int64
-                ), f"Unexpected {type(output_row_cnt)=}. Expected int."
-                if row_limit and output_row_cnt > row_limit:
-                    return pd.DataFrame(
-                        [
-                            {
-                                "row_limit_exceeded": f"{output_row_cnt=} exceeds {row_limit=}"
-                            }
-                        ]
-                    )
-            except Exception as e:
-                logger.error(f"Error checking row count: {e}")
+            # get temp table name
+            temp_table = f"{job.destination.dataset_id}.{job.destination.table_id}"
+            logger.success(f"Query result stored in {temp_table}")
+            output_row_cnt = self.q(
+                f"SELECT count(*) FROM {temp_table}", is_checking_row_cnt=True
+            ).iloc[0, 0]
+
+        # get row count from temp table
+        if not is_checking_row_cnt:
+            if row_limit and output_row_cnt > row_limit:
+                return pd.DataFrame(
+                    [
+                        {
+                            "row_limit_exceeded": f"{output_row_cnt=:,.0f} exceeds {row_limit=:,.0f}"
+                        }
+                    ]
+                )
 
         self.beep(440, 300)
         return job_result.to_dataframe()
@@ -226,6 +226,59 @@ class BigQuery:
             schema = None
             logger.info("No schema inferred")
             return schema
+
+    def see_query_example(
+        self,
+        table_name: str,
+        dataset_name: str,
+        keywords: Optional[str] = None,
+        row_cnt: int = 5,
+        min_run: int = 5,
+        dbda_only: bool = True,
+        is_nested: bool = False,
+    ) -> list[str]:
+        keywords_filter = (
+            f'and regexp_contains(query,r"(?i){keywords}")' if keywords else ""
+        )
+        dbda_filter = (
+            (
+                'AND ( regexp_contains(user,r"(?i)db-airflow") or regexp_contains(user_grp,r"(?i)dbda") )'
+            )
+            if dbda_only
+            else ""
+        )
+        df = self.q(
+            rf"""
+            SELECT DISTINCT 
+                query,
+                COUNT(*) as cnt
+            FROM dev_dbda.bq_query_history_analysis
+            WHERE 1=1 
+            AND (
+                regexp_contains(referenced_tables,r"(?i){dataset_name}.{table_name}")
+                or regexp_contains(destination_table,r"(?i){dataset_name}.{table_name}")
+            )
+            AND regexp_contains(job_type_level2,r"(?i)scheduled_query|script_job")
+            {dbda_filter}
+            {keywords_filter}
+            GROUP BY All having cnt >= {min_run} 
+            ORDER BY cnt DESC limit {row_cnt}
+        """
+        )
+        if df.empty and not is_nested:
+            return self.see_query_example(
+                table_name=table_name,
+                dataset_name=dataset_name,
+                keywords=keywords,
+                row_cnt=row_cnt,
+                min_run=1,
+                dbda_only=False,
+                is_nested=True,
+            )
+
+        query_list = df["query"].tolist()
+
+        return query_list
 
     def drop_dataset(self, dataset_id: str, project: Optional[str] = None) -> None:
         project = project or self.project
