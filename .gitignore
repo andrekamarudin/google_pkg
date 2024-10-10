@@ -1,2 +1,4 @@
 **/test.py
 **/*.pyc
+google_api/packages/.env
+google_api/.env
