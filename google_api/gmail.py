@@ -6,7 +6,10 @@ import sys
 from dataclasses import dataclass, field
 from email import policy
 from email.message import Message
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from email.parser import BytesParser
+from email.utils import formatdate
 from enum import Enum
 from pathlib import Path
 from pprint import pformat, pprint
@@ -14,11 +17,12 @@ from typing import Any, Callable, Dict, List, Optional
 
 from bs4 import BeautifulSoup
 from google.auth.transport.requests import Request
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google.oauth2 import service_account
 from loguru import logger
-from packages.gservice import GService, ServiceKey
-from packages.helper import condense_text
 from pydantic import BaseModel
+
+from google_api.packages.gservice import GService, ServiceKey
+from google_api.packages.helper import condense_text
 
 
 class Criteria(Enum):
@@ -59,29 +63,37 @@ class Label(Enum):
     TTD = "Label_1833152009763122946"
 
 
-@dataclass
-class GmailService(GService):
-    SCOPES: List[str] = field(
-        default_factory=lambda: [
+class GmailService:
+    def __init__(
+        self,
+        service_key: Optional[ServiceKey] = None,
+        service_key_path: Optional[Path | str] = None,
+    ) -> None:
+        self.SCOPES: List[str] = [
             f"https://www.googleapis.com/auth/gmail.{action}"
             for action in ["readonly", "modify", "send"]
         ]
-    )
-    cred_file_folder: Path = Path(os.getenv("USERPROFILE"))
-    pickle_name: str = "gmail_token.pickle"
-
-    def __post_init__(self, service_key: Optional[ServiceKey] = None) -> None:
+        self.gservice = GService(
+            service_key_path=service_key_path,
+            service_key=service_key,
+        )
+        self.credentials = service_account.Credentials.from_service_account_info(
+            info=self.gservice.sa_info, scopes=self.SCOPES
+        )
+        self.cred_file_folder: Path = Path(os.environ["USERPROFILE"])
+        self.pickle_name: str = "gmail_token.pickle"
         self.user_id: str = "me"
         self.token_pickle = self.cred_file_folder / self.pickle_name
-        super().__init__(service_key=service_key)
-        self.build_service(
+        self.gservice.build_service(
             scopes=self.SCOPES,
             short_name="gmail",
             version="v1",
             credentials=self.get_credentials(),
         )
 
-    def get_credentials(self, scopes: Optional[List[str]] = None) -> Any:
+    def get_credentials(
+        self, scopes: Optional[List[str]] = None, final: bool = False
+    ) -> Any:
         if os.path.exists(self.token_pickle):
             with open(self.token_pickle, "rb") as token:
                 creds = pickle.load(token)
@@ -97,11 +109,8 @@ class GmailService(GService):
                 logger.error(f"Failed to refresh credentials: {e}")
                 os.remove(self.token_pickle)
                 creds = None  # Set creds to None to trigger re-authentication
-        if not creds or not creds.valid:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                self.service_key_path, scopes or self.SCOPES
-            )
-            creds = flow.run_local_server(port=0)
+        if not final and (not creds or not creds.valid):
+            creds = self.get_credentials(scopes=self.SCOPES, final=True)
 
         with open(self.token_pickle, "wb") as token:
             pickle.dump(creds, token)
@@ -110,7 +119,7 @@ class GmailService(GService):
     def _get_msg_payload(self, msg_id: str) -> Optional[str]:
         try:
             message = (
-                self.service.users()
+                self.gservice.service.users()
                 .messages()
                 .get(userId=self.user_id, id=msg_id, format="raw")
                 .execute()
@@ -172,7 +181,7 @@ class GmailService(GService):
 
     def get_label_id_by_name(self, label_name: str) -> Optional[str]:
         response: Dict[str, Any] = (
-            self.service.users().labels().list(userId=self.user_id).execute()
+            self.gservice.service.users().labels().list(userId=self.user_id).execute()
         )
         for label in response["labels"]:
             if label["name"] == label_name:
@@ -184,7 +193,7 @@ class GmailService(GService):
     ) -> Dict[str, Any]:
         if label_id := label.value:
             response = await (
-                self.service.users()
+                self.gservice.service.users()
                 .messages()
                 .modify(
                     userId=self.user_id,
@@ -200,7 +209,10 @@ class GmailUI(GmailService):
     def search(self, query: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         self.last_query = query
         msg_dicts: List[Dict[str, Any]] = (
-            self.service.users().messages().list(userId=self.user_id, q=query).execute()
+            self.gservice.service.users()
+            .messages()
+            .list(userId=self.user_id, q=query)
+            .execute()
         ).get("messages")
         if not msg_dicts:
             logger.warning("No messages found")
@@ -370,10 +382,44 @@ class GmailUI(GmailService):
                     msg_id=email["id"], thread_id=email["threadId"], headers=headers
                 )
 
+    def send_email(
+        self,
+        recipients: list[str],
+        subject: str = "",
+        body: str = "",
+    ):
+        message = MIMEMultipart("alternative")
+        message["Subject"] = subject
+        message["From"] = self.user_id
+        message["To"] = ",".join(recipients)
+        message["Date"] = formatdate(localtime=True)
+
+        message.attach(MIMEText(body, "plain"))
+
+        raw_message = base64.urlsafe_b64encode(
+            message.as_bytes()
+        ).decode()  # Encode to base64
+        self.gservice.service.users().messages().send(
+            userId=self.user_id,
+            body={"raw": raw_message},  # Use the encoded message as the body
+        ).execute()
+
+
+def main():
+    gmail = GmailUI(service_key_path=os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
+    print(gmail.search("SGD purchase complete"))
+    return
+    gmail.send_email(
+        recipients=["andre.kamarudin@gmail.com"],
+        subject="Test email",
+        body="This is a test email sent from the Gmail API.",
+    )
+
 
 if __name__ == "__main__":
     logger.remove()
     LOG_FMT = "<level>{level}: {message}</level> <black>({file} / {module} / {function} / {line})</black>"
     logger.add(sys.stdout, level="SUCCESS", format=LOG_FMT)
     gmail = GmailUI()
-    asyncio.run(gmail.main_loop(query="SGD purchase complete"))
+    # asyncio.run(gmail.main_loop(query="SGD purchase complete"))
+    main()
