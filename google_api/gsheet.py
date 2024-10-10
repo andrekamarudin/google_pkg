@@ -27,13 +27,15 @@ class GSheetAPI(GService):
         value=None,
         range: Optional[str] = None,
         spreadsheet_id: Optional[str] = None,
-        service_key_path: Optional[Path] = None,
         service_key: Optional[ServiceKey] = None,
+        service_key_path: Optional[Path | str] = None,
+        service_key_env_var: Optional[str] = None,
     ) -> None:
         logger.info("Initializing GSheetAPI")
         super().__init__(
-            service_key_path=service_key_path,
             service_key=service_key,
+            service_key_path=service_key_path,
+            service_key_env_var=service_key_env_var,
         )
         self.build_service(
             scopes=self.SCOPES, short_name=self.SCOPES_SN, version=self.VERSION

@@ -1,24 +1,28 @@
 import asyncio
 import base64
 import os
-import pickle
 import sys
-from dataclasses import dataclass, field
 from email import policy
 from email.message import Message
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from email.parser import BytesParser
+from email.utils import formatdate
 from enum import Enum
 from pathlib import Path
 from pprint import pformat, pprint
 from typing import Any, Callable, Dict, List, Optional
 
 from bs4 import BeautifulSoup
-from google.auth.transport.requests import Request
-from google_auth_oauthlib.flow import InstalledAppFlow
+from dotenv import load_dotenv
+from google.oauth2 import service_account
 from loguru import logger
-from packages.gservice import GService, ServiceKey
-from packages.helper import condense_text
 from pydantic import BaseModel
+
+from google_api.packages.gservice import GService, ServiceKey
+from google_api.packages.helper import condense_text
+
+load_dotenv()
 
 
 class Criteria(Enum):
@@ -59,58 +63,29 @@ class Label(Enum):
     TTD = "Label_1833152009763122946"
 
 
-@dataclass
-class GmailService(GService):
-    SCOPES: List[str] = field(
-        default_factory=lambda: [
+class GmailService:
+    def __init__(self, *args, **kwargs) -> None:
+        self.SCOPES: List[str] = [
             f"https://www.googleapis.com/auth/gmail.{action}"
             for action in ["readonly", "modify", "send"]
         ]
-    )
-    cred_file_folder: Path = Path(os.getenv("USERPROFILE"))
-    pickle_name: str = "gmail_token.pickle"
-
-    def __post_init__(self, service_key: Optional[ServiceKey] = None) -> None:
+        self.gservice = GService(*args, **kwargs)
+        self.credentials = service_account.Credentials.from_service_account_info(
+            info=self.gservice.sa_info, scopes=self.SCOPES
+        )
+        self.cred_file_folder: Path = Path(os.environ["USERPROFILE"])
         self.user_id: str = "me"
-        self.token_pickle = self.cred_file_folder / self.pickle_name
-        super().__init__(service_key=service_key)
-        self.build_service(
+        self.gservice.build_service(
             scopes=self.SCOPES,
             short_name="gmail",
             version="v1",
-            credentials=self.get_credentials(),
+            credentials=self.credentials,
         )
-
-    def get_credentials(self, scopes: Optional[List[str]] = None) -> Any:
-        if os.path.exists(self.token_pickle):
-            with open(self.token_pickle, "rb") as token:
-                creds = pickle.load(token)
-        else:
-            creds = None
-
-        if creds and creds.expired and creds.refresh_token:
-            os.remove(self.token_pickle)
-            logger.info("creds.expired")
-            try:
-                creds.refresh(Request())  # refresh the credentials
-            except Exception as e:
-                logger.error(f"Failed to refresh credentials: {e}")
-                os.remove(self.token_pickle)
-                creds = None  # Set creds to None to trigger re-authentication
-        if not creds or not creds.valid:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                self.service_key_path, scopes or self.SCOPES
-            )
-            creds = flow.run_local_server(port=0)
-
-        with open(self.token_pickle, "wb") as token:
-            pickle.dump(creds, token)
-        return creds
 
     def _get_msg_payload(self, msg_id: str) -> Optional[str]:
         try:
             message = (
-                self.service.users()
+                self.gservice.service.users()
                 .messages()
                 .get(userId=self.user_id, id=msg_id, format="raw")
                 .execute()
@@ -124,11 +99,11 @@ class GmailService(GService):
             return None
         return message_payload
 
-    def _message_to_content(self, email_message: Message) -> str:
-        if isinstance(email_message, Message):
-            content_type = email_message.get_content_type()
-        else:
-            return f"email_message ({type(email_message)}): {str(email_message)}"
+    def _message_to_content(self, email_message: Message) -> str | None:
+        assert isinstance(
+            email_message, Message
+        ), f"email_message ({type(email_message)}): {str(email_message)}"
+        content_type: str = email_message.get_content_type()
         if content_type == "text/plain":
             return email_message.get_content()
         elif content_type == "text/html":
@@ -151,7 +126,7 @@ class GmailService(GService):
         email_message: Message = BytesParser(policy=policy.default).parsebytes(
             raw_email
         )
-        body: str = self._message_to_content(email_message)
+        body: str = self._message_to_content(email_message) or ""
         if not body and email_message.is_multipart():
             body = ""
             for part in email_message.iter_parts():
@@ -162,7 +137,7 @@ class GmailService(GService):
             logger.error(f"Failed to parse body for {message_payload[:100]}...")
             return "(no body found)"
 
-    def _payload_to_headers(self, message_payload: str) -> Dict[str, Any]:
+    def _payload_to_headers(self, message_payload: str) -> EmailHeaders:
         email_bytes: bytes = base64.urlsafe_b64decode(message_payload)
         message: Message = BytesParser(policy=policy.default).parsebytes(email_bytes)
         email_dict: Dict[str, Any] = dict(message.items())
@@ -172,7 +147,7 @@ class GmailService(GService):
 
     def get_label_id_by_name(self, label_name: str) -> Optional[str]:
         response: Dict[str, Any] = (
-            self.service.users().labels().list(userId=self.user_id).execute()
+            self.gservice.service.users().labels().list(userId=self.user_id).execute()
         )
         for label in response["labels"]:
             if label["name"] == label_name:
@@ -181,10 +156,10 @@ class GmailService(GService):
 
     async def _mod_label(
         self, msg_id: str, label: Label, to_add: bool = True
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | None:
         if label_id := label.value:
             response = await (
-                self.service.users()
+                self.gservice.service.users()
                 .messages()
                 .modify(
                     userId=self.user_id,
@@ -194,13 +169,18 @@ class GmailService(GService):
                 .execute()  # Remove await here
             )
             return response  # Return the response directly
+        else:
+            return None
 
 
 class GmailUI(GmailService):
     def search(self, query: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         self.last_query = query
         msg_dicts: List[Dict[str, Any]] = (
-            self.service.users().messages().list(userId=self.user_id, q=query).execute()
+            self.gservice.service.users()
+            .messages()
+            .list(userId=self.user_id, q=query)
+            .execute()
         ).get("messages")
         if not msg_dicts:
             logger.warning("No messages found")
@@ -213,7 +193,7 @@ class GmailUI(GmailService):
             return msg_dicts
 
     async def move_to_inbox(
-        self, msg_id: str, thread_id: str, headers: EmailHeaders = None
+        self, msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
     ) -> None:
         await asyncio.gather(
             self._mod_label(msg_id, Label.SPAM, to_add=False),
@@ -223,7 +203,7 @@ class GmailUI(GmailService):
         print(f"Moved {msg_id} to inbox email")
 
     async def mark_as_ttd(
-        self, msg_id: str, thread_id: str, headers: EmailHeaders = None
+        self, msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
     ) -> None:
         await asyncio.gather(
             self._mod_label(msg_id, Label.TTD),
@@ -233,7 +213,7 @@ class GmailUI(GmailService):
         print(f"Marked {msg_id} as TTD email")
 
     async def mark_as_read(
-        self, msg_id: str, thread_id: str, headers: EmailHeaders = None
+        self, msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
     ) -> None:
         await asyncio.gather(
             self._mod_label(msg_id, Label.UNREAD, to_add=False),
@@ -241,7 +221,7 @@ class GmailUI(GmailService):
         print(f"Marked {msg_id} as read email")
 
     async def delete_email(
-        self, msg_id: str, thread_id: str, headers: EmailHeaders = None
+        self, msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
     ) -> None:
         try:
             await asyncio.gather(
@@ -253,7 +233,7 @@ class GmailUI(GmailService):
             logger.error(f"Failed to delete email {msg_id}: {e}")
 
     async def archive_email(
-        self, msg_id: str, thread_id: str, headers: EmailHeaders = None
+        self, msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
     ) -> None:
         await asyncio.gather(
             self._mod_label(msg_id, Label.INBOX, to_add=False),
@@ -262,7 +242,7 @@ class GmailUI(GmailService):
         print(f"Archived {msg_id}")
 
     async def mark_as_spam(
-        self, msg_id: str, thread_id: str, headers: EmailHeaders = None
+        self, msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
     ) -> None:
         await asyncio.gather(
             self._mod_label(msg_id, Label.SPAM),
@@ -271,14 +251,14 @@ class GmailUI(GmailService):
         print(f"Marked {msg_id} as spam")
 
     def open_msg(
-        self, msg_id: str, thread_id: str, headers: EmailHeaders = None
+        self, msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
     ) -> None:
         url = f"https://mail.google.com/mail/u/0/#inbox/{msg_id}"
         os.system(f'start "" "{url}"')
 
     def msg_id_to_headers(self, msg_id: str) -> EmailHeaders:
         payload = self._get_msg_payload(msg_id)
-        return self._payload_to_headers(payload)
+        return self._payload_to_headers(payload or "")
 
     def _show_options(self, options_dict: Dict[str, Callable]) -> str:
         return "\n".join(
@@ -288,19 +268,24 @@ class GmailUI(GmailService):
     async def _batch_process(
         self,
         msgs: List[Dict[str, Any]],
-        decision: Callable,
-        headers: EmailHeaders = None,
-    ) -> List[None]:
-        return await asyncio.gather(
+        decision: str,
+        headers: Optional[EmailHeaders] = None,
+    ) -> None:
+        assert decision in self.email_decisions, f"Invalid decision: {decision}"
+        function_to_call: Callable = self.email_decisions[decision]
+
+        await asyncio.gather(
             *[
-                self.email_decisions[decision](
+                function_to_call(
                     msg_id=msg["id"], thread_id=msg["threadId"], headers=headers
                 )
                 for msg in msgs
             ]
         )
 
-    async def _batch_decision(self, criteria: Criteria, headers: EmailHeaders) -> None:
+    async def _batch_decision(
+        self, criteria: Criteria, headers: Optional[EmailHeaders] = None
+    ) -> None:
         operator = criteria.value["operator"]
         property = criteria.value["property"]
         keyword = getattr(headers, property)
@@ -317,19 +302,19 @@ class GmailUI(GmailService):
         return await self._batch_process(all_msgs, decision, headers)
 
     async def handle_sender(
-        self, msg_id: str, thread_id: str, headers: EmailHeaders = None
-    ) -> List[None]:
-        return await self._batch_decision(Criteria.SENDER, headers)
+        self, msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
+    ) -> None:
+        await self._batch_decision(Criteria.SENDER, headers)
 
     async def handle_thread(
-        self, msg_id: str, thread_id: str, headers: EmailHeaders = None
-    ) -> List[None]:
-        return await self._batch_decision(Criteria.THREAD_ID, headers)
+        self, msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
+    ) -> None:
+        await self._batch_decision(Criteria.THREAD_ID, headers)
 
     async def handle_subject(
-        self, msg_id: str, thread_id: str, headers: EmailHeaders = None
-    ) -> List[None]:
-        return await self._batch_decision(Criteria.SUBJECT, headers)
+        self, msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
+    ) -> None:
+        await self._batch_decision(Criteria.SUBJECT, headers)
 
     @property
     def email_decisions(self) -> Dict[str, Callable]:
@@ -370,10 +355,42 @@ class GmailUI(GmailService):
                     msg_id=email["id"], thread_id=email["threadId"], headers=headers
                 )
 
+    def send_email(
+        self,
+        recipients: list[str],
+        subject: str = "",
+        body: str = "",
+    ):
+        message = MIMEMultipart("alternative")
+        message["Subject"] = subject
+        message["From"] = self.user_id
+        message["To"] = ",".join(recipients)
+        message["Date"] = formatdate(localtime=True)
+
+        message.attach(MIMEText(body, "plain"))
+
+        raw_message = base64.urlsafe_b64encode(
+            message.as_bytes()
+        ).decode()  # Encode to base64
+        self.gservice.service.users().messages().send(
+            userId=self.user_id,
+            body={"raw": raw_message},  # Use the encoded message as the body
+        ).execute()
+
+
+def main():
+    gmail = GmailUI(service_key_path=os.environ["SMERK_GOOGLE_APPLICATION_CREDENTIALS"])
+
+    # Test with listing Gmail labels to ensure the API and credentials are functioning
+    try:
+        response = gmail.gservice.service.users().labels().list(userId="me").execute()
+        print("Labels List:", response)
+    except Exception as e:
+        print("Error while fetching labels:", e)
+
 
 if __name__ == "__main__":
     logger.remove()
     LOG_FMT = "<level>{level}: {message}</level> <black>({file} / {module} / {function} / {line})</black>"
     logger.add(sys.stdout, level="SUCCESS", format=LOG_FMT)
-    gmail = GmailUI()
-    asyncio.run(gmail.main_loop(query="SGD purchase complete"))
+    main()
