@@ -64,24 +64,23 @@ class Label(Enum):
 
 
 class GmailService:
-    def __init__(
-        self,
-        service_key: Optional[ServiceKey] = None,
-        service_key_path: Optional[Path | str] = None,
-    ) -> None:
+    def __init__(self, *args, **kwargs) -> None:
         self.SCOPES: List[str] = [
             f"https://www.googleapis.com/auth/gmail.{action}"
             for action in ["readonly", "modify", "send"]
         ]
-        self.gservice = GService(
-            service_key_path=service_key_path,
-            service_key=service_key,
-        )
+        self.gservice = GService(*args, **kwargs)
         self.credentials = service_account.Credentials.from_service_account_info(
             info=self.gservice.sa_info, scopes=self.SCOPES
         )
         self.cred_file_folder: Path = Path(os.environ["USERPROFILE"])
         self.user_id: str = "me"
+        self.gservice.build_service(
+            scopes=self.SCOPES,
+            short_name="gmail",
+            version="v1",
+            credentials=self.credentials,
+        )
 
     def _get_msg_payload(self, msg_id: str) -> Optional[str]:
         try:
@@ -380,8 +379,9 @@ class GmailUI(GmailService):
 
 
 def main():
-    gmail = GmailUI(service_key_path=os.environ["SMERK_GOOGLE_APPLICATION_CREDENTIALS"])
-    print(gmail.search("SGD"))
+    gmail = GmailUI(service_key_env_var="SMERK_GOOGLE_APPLICATION_CREDENTIALS")
+    print(gmail.gservice.sa_info)
+    print(gmail.search("SGD purchase complete"))
     return
     gmail.send_email(
         recipients=["andre.kamarudin@gmail.com"],

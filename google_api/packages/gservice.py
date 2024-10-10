@@ -33,52 +33,69 @@ class GService:
         self,
         service_key: Optional[ServiceKey | dict] = None,
         service_key_path: Optional[Path | str] = None,
+        service_key_env_var: Optional[str] = None,
     ):
         logger.info("Initializing GService")
 
-        if isinstance(service_key_path, str | Path):
-            self.service_key_path: Path = (
+        assert (
+            service_key
+            or service_key_path
+            or service_key_env_var
+            or os.getenv("DBDA_GOOGLE_APPLICATION_CREDENTIALS")
+        ), (
+            "service_key, service_key_path, or service_key_env_var must be provided\n"
+            + f"service_key: {service_key=}\n"
+            + f"service_key_path: {service_key_path=}\n"
+            + f"service_key_env_var: {service_key_env_var=}\n"
+            + f"DBDA_GOOGLE_APPLICATION_CREDENTIALS: {os.getenv('DBDA_GOOGLE_APPLICATION_CREDENTIALS')=}\n"
+        )
+
+        if service_key and isinstance(service_key, ServiceKey):
+            self.service_key = service_key
+        elif service_key_env_var:
+            service_key_path_str: str = os.environ[service_key_env_var]
+            self.service_key_path: Path = Path(service_key_path_str)
+            assert (
+                self.service_key_path.exists()
+            ), f"service_key_env_var provided not found: {service_key_path_str}"
+            self.service_key: ServiceKey = ServiceKey(
+                **json.loads(self.service_key_path.read_text())
+            )
+        elif isinstance(service_key_path, str | Path):
+            service_key_path: Path = (
                 Path(service_key_path)
                 if isinstance(service_key_path, str)
                 else service_key_path
             )
-        else:
-            self.service_key_path = None
-
-        if isinstance(service_key, ServiceKey):
-            service_key_checked: ServiceKey = service_key
-        elif isinstance(service_key, dict):
-            service_key_checked: ServiceKey = ServiceKey(**service_key)
-        elif isinstance(service_key_path, str) and Path(service_key_path).exists():
-            service_key_checked: ServiceKey = ServiceKey(
-                **json.loads(Path(service_key_path).read_text())
-            )
-
-        elif isinstance(service_key_path, Path) and service_key_path.exists():
-            service_key_checked: ServiceKey = ServiceKey(
-                **json.loads(service_key_path.read_text())
-            )
             self.service_key_path = service_key_path
+            assert (
+                self.service_key_path.exists()
+            ), f"service_key_path provided not found: {service_key_path}"
+            service_key_path_str: str = self.service_key_path.read_text()
+            self.service_key: ServiceKey = ServiceKey(
+                **json.loads(service_key_path_str)
+            )
         elif GOOGLE_APPLICATION_CREDENTIALS := os.environ.get(
             "DBDA_GOOGLE_APPLICATION_CREDENTIALS"
-        ) or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+        ):
             self.service_key_path: Path = Path(GOOGLE_APPLICATION_CREDENTIALS)
-            if self.service_key_path.exists():
-                service_key_checked: ServiceKey = ServiceKey(
-                    **json.loads(self.service_key_path.read_text())
-                )
-            else:
-                raise Exception(
-                    f"Provided Service account JSON file path does not exist: {self.service_key_path}"
-                )
+            assert self.service_key_path.exists(), f"DBDA_GOOGLE_APPLICATION_CREDENTIALS provided not found: {GOOGLE_APPLICATION_CREDENTIALS}"
+            service_key_path_str: str = self.service_key_path.read_text()
+            self.service_key: ServiceKey = ServiceKey(
+                **json.loads(service_key_path_str)
+            )
         else:
             raise Exception(
-                "Service account JSON file not found in system or environment variables"
+                "Unexpected types:\n" + f"service_key: {type(service_key)=}\n"
+                if service_key
+                else "" + f"service_key_path: {type(service_key_path)=}\n"
+                if service_key_path
+                else "" + f"service_key_env_var: {type(service_key_env_var)=}\n"
+                if service_key_env_var
+                else ""
             )
 
-        if isinstance(service_key_checked, ServiceKey):
-            self.sa_info: dict = service_key_checked.model_dump()
-            logger.success("Initialized GService")
+        self.sa_info: dict = self.service_key.model_dump()
 
     def build_service(self, scopes, short_name, version, credentials=None):
         self.credentials = (
