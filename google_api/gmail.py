@@ -379,21 +379,18 @@ class GmailUI(GmailService):
 
 
 def main():
-    gmail = GmailUI(service_key_env_var="SMERK_GOOGLE_APPLICATION_CREDENTIALS")
-    print(gmail.gservice.sa_info)
-    print(gmail.search("SGD purchase complete"))
-    return
-    gmail.send_email(
-        recipients=["andre.kamarudin@gmail.com"],
-        subject="Test email",
-        body="This is a test email sent from the Gmail API.",
-    )
+    gmail = GmailUI(service_key_path=os.environ["SMERK_GOOGLE_APPLICATION_CREDENTIALS"])
+
+    # Test with listing Gmail labels to ensure the API and credentials are functioning
+    try:
+        response = gmail.gservice.service.users().labels().list(userId="me").execute()
+        print("Labels List:", response)
+    except Exception as e:
+        print("Error while fetching labels:", e)
 
 
 if __name__ == "__main__":
     logger.remove()
     LOG_FMT = "<level>{level}: {message}</level> <black>({file} / {module} / {function} / {line})</black>"
     logger.add(sys.stdout, level="SUCCESS", format=LOG_FMT)
-    gmail = GmailUI()
-    # asyncio.run(gmail.main_loop(query="SGD purchase complete"))
     main()
