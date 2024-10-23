@@ -2,3 +2,6 @@
 **/*.pyc
 google_api/packages/.env
 google_api/.env
+poetry.lock
+google.code-workspace
+.vscode/settings.json
