@@ -1,5 +1,6 @@
 import os
 import platform
+import re
 import sys
 import time
 import warnings
@@ -105,6 +106,10 @@ class BigQuery:
         project = project or self.project
         self.completion_alert = completion_alert
 
+        dry_run_result = self._dry_run(sql, project)
+        if not dry_run_result["success"]:
+            return pd.DataFrame([dry_run_result])
+
         job: bigquery.QueryJob = self.client.query(sql)
 
         if job.ddl_target_table:
@@ -130,26 +135,35 @@ class BigQuery:
         else:
             logger.success("Query completed without returning any rows")
 
-        if job.destination and not is_checking_row_cnt:
-            # get temp table name
-            temp_table = f"{job.destination.dataset_id}.{job.destination.table_id}"
-            logger.success(f"Query result stored in {temp_table}")
-            output_row_cnt = self.q(
-                f"SELECT count(*) FROM {temp_table}", is_checking_row_cnt=True
-            ).iloc[0, 0]
+        # get temp table name
 
-        # get row count from temp table
         if not is_checking_row_cnt:
-            if row_limit and output_row_cnt > row_limit:
+            if job.destination:
+                temp_table = f"{job.destination.dataset_id}.{job.destination.table_id}"
+                logger.success(f"Query result stored in {temp_table}")
+
+            output_row_cnt = (
+                job_result.total_rows
+                or self.q(
+                    f"SELECT count(*) FROM {temp_table}", is_checking_row_cnt=True
+                ).iloc[0, 0]
+            )
+
+            if (
+                row_limit
+                and isinstance(output_row_cnt, int)
+                and output_row_cnt > row_limit
+            ):
                 return pd.DataFrame(
                     [
                         {
-                            "row_limit_exceeded": f"{output_row_cnt=:,.0f} exceeds {row_limit=:,.0f}"
+                            "success": False,
+                            "error": "Row limit exceeded. Please reduce the number of rows returned by the sql or increase the row limit.",
+                            "output_row_cnt": output_row_cnt,
+                            "row_limit": row_limit,
                         }
                     ]
                 )
-
-        self.beep(440, 300)
         return job_result.to_dataframe()
 
     def upload_df_to_bq(
@@ -227,23 +241,69 @@ class BigQuery:
             logger.info("No schema inferred")
             return schema
 
+    def _dry_run(self, sql: str, project: Optional[str] = None) -> dict:
+        project = project or self.project
+        job_config = bigquery.QueryJobConfig(dry_run=True)
+        try:
+            job: bigquery.QueryJob = self.client.query(sql, job_config=job_config)
+            return {
+                "success": True,
+                "bytes_processed": job.total_bytes_processed,
+            }
+        except Exception as e:
+            match = re.search(r"at \[(\d+):(\d+)\]", str(e))
+            error_to_print = str(e)
+            if match:
+                line_no, char_no = match.groups()
+                line_no = int(line_no) - 1
+                char_no = int(char_no) - 1
+                sql_lines = sql.splitlines()
+                lines_to_show = 5
+                lines_bef = sql_lines[line_no - lines_to_show : line_no]
+                lines_aft = sql_lines[line_no + 1 : line_no + lines_to_show]
+                line = sql_lines[line_no]
+                lines_colored = (
+                    f"{Fore.GREEN}"
+                    f"{'\n'.join(lines_bef)}\n"
+                    f"{line[:char_no]}"
+                    f"{Fore.LIGHTRED_EX}{line[char_no:]}"
+                    f"{Fore.GREEN}\n"
+                    f"{'\n'.join(lines_aft)}"
+                    f"{Fore.RESET}"
+                )
+                error_to_print += f"\n{lines_colored}"
+            logger.error(error_to_print)
+            return {"success": False, "error": str(e), "sql": sql}
+
     def see_query_example(
         self,
-        table_name: str,
-        dataset_name: str,
+        destination_table_name: str,
+        destination_dataset_name: str,
+        source_table_name: str,
+        source_dataset_name: str,
         keywords: Optional[str] = None,
         row_cnt: int = 5,
         min_run: int = 5,
         dbda_only: bool = True,
         is_nested: bool = False,
     ) -> list[str]:
+        table_filters = []
+        table_filters.append(
+            f'regexp_contains(referenced_tables,r"(?i){source_dataset_name}.{source_table_name}")'
+            if source_table_name
+            else None
+        )
+        table_filters.append(
+            f'regexp_contains(destination_table,r"(?i){destination_dataset_name}.{destination_table_name}")'
+            if destination_table_name
+            else None
+        )
+        table_filters_str = "and " + (" and ".join(table_filters) or "1=1")
         keywords_filter = (
             f'and regexp_contains(query,r"(?i){keywords}")' if keywords else ""
         )
         dbda_filter = (
-            (
-                'AND ( regexp_contains(user,r"(?i)db-airflow") or regexp_contains(user_grp,r"(?i)dbda") )'
-            )
+            'AND ( regexp_contains(user,r"(?i)db-airflow") or regexp_contains(user_grp,r"(?i)dbda") )'
             if dbda_only
             else ""
         )
@@ -254,21 +314,20 @@ class BigQuery:
                 COUNT(*) as cnt
             FROM dev_dbda.bq_query_history_analysis
             WHERE 1=1 
-            AND (
-                regexp_contains(referenced_tables,r"(?i){dataset_name}.{table_name}")
-                or regexp_contains(destination_table,r"(?i){dataset_name}.{table_name}")
-            )
-            AND regexp_contains(job_type_level2,r"(?i)scheduled_query|script_job")
             {dbda_filter}
             {keywords_filter}
+            {table_filters_str}
+            AND regexp_contains(job_type_level2,r"(?i)scheduled_query|script_job")
             GROUP BY All having cnt >= {min_run} 
             ORDER BY cnt DESC limit {row_cnt}
         """
         )
         if df.empty and not is_nested:
             return self.see_query_example(
-                table_name=table_name,
-                dataset_name=dataset_name,
+                destination_table_name=destination_table_name,
+                destination_dataset_name=destination_dataset_name,
+                source_table_name=source_table_name,
+                source_dataset_name=source_dataset_name,
                 keywords=keywords,
                 row_cnt=row_cnt,
                 min_run=1,
@@ -324,14 +383,13 @@ class BigQuery:
             if table_keyword
             else ""
         )
-        results = self.q(
-            f"""
+        sql = f"""
             SELECT DISTINCT  
                 table_id, 
                 column_name,
-                is_partitioning_column,
                 data_type,
-                # clustering_ordinal_position,
+                STRING_AGG(if(is_partitioning_column='YES',column_name,Null),', ')
+                 over(PARTITION BY table_id) as table_partitioning_columns,
             FROM ads_dbda.db_database_index
             WHERE 1=1 
             {col_filter}
@@ -339,8 +397,7 @@ class BigQuery:
             {table_filter}
             ORDER BY 1,2,3
         """
-        )
-        return results
+        return self.q(sql)
 
     def get_table_sample_rows(
         self,
@@ -551,12 +608,3 @@ class BigQueryService:
         except NotFound:
             logger.error(f"Table {table_id} does not exist. Continuing in 5 seconds...")
             return table_ref
-
-
-def main():
-    bq = BigQuery(project="fairprice-bigquery")
-    print(bq.q("SELECT current_date('+8') as date").to_markdown())
-
-
-if __name__ == "__main__":
-    main()
