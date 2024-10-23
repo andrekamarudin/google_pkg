@@ -1,16 +1,21 @@
+# import asyncio
+import json
 import os
 import platform
 import re
 import sys
 import time
 import warnings
+from datetime import datetime
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Any, Optional
 
 import pandas as pd
+import pytz
 from colorama import Fore, Style
 from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
+from google.cloud.bigquery.table import RowIterator
 from google.oauth2 import service_account
 from loguru import logger
 from tqdm import tqdm
@@ -78,93 +83,97 @@ class BigQuery:
         )
         self.client = self.bq_service.client
 
-    def beep(self, frequency: int, duration: int):
-        if not self.completion_alert:
-            return
-        if hasattr(self, "_beep"):
-            pass
-        elif platform.system() == "Windows":
-            import winsound
+    # async def _process_page(self, page, qbar, results):
+    def _process_page(self, page, qbar, results):
+        for row in page:
+            results.append(dict(row))
+            qbar.update(1)
 
-            self._beep = winsound.Beep
+    def _load_to_dataframe(self, job_result, qbar):
+        # async def _load_to_dataframe(self, job_result, qbar):
+        results = []
+        for page in job_result.pages:
+            self._process_page(page, qbar, results)
+        # tasks = [self._process_page(page, qbar, results) for page in job_result.pages]
+        # await asyncio.gather(*tasks)
+        qbar.close()
+        return pd.DataFrame(results)
 
-        elif platform.system() == "Darwin":
-            self._beep = lambda *args, **kwargs: os.system('say "beep"')
-        else:
-            self._beep = lambda *args, **kwargs: None
-
-        return self._beep(frequency, duration)
-
-    def q(
+    def _query(
         self,
         sql: str,
         project: Optional[str] = None,
-        row_limit: Optional[int] = 500,
-        completion_alert: bool = False,
-        is_checking_row_cnt: bool = False,
-    ) -> pd.DataFrame:
+        page_size: int = 50000,
+        sample_row_cnt: int = 5,
+    ) -> dict[str, Any]:
         project = project or self.project
-        self.completion_alert = completion_alert
 
         dry_run_result = self._dry_run(sql, project)
         if not dry_run_result["success"]:
-            return pd.DataFrame([dry_run_result])
+            return dry_run_result
+        sql_extract = re.sub(r"[\s\n]+", " ", sql)[:50]
+        logger.success(
+            f"Dry run successful for `{sql_extract}`... Queueing & running query"
+        )
+
+        if (query_size := dry_run_result["bytes_processed"] / 1e9) > 5:
+            logger.warning(f"Query bytes: {query_size:,.2f} GB")
 
         job: bigquery.QueryJob = self.client.query(sql)
 
-        if job.ddl_target_table:
-            logger.success(
-                f"{job.ddl_operation_performed} done to {job.ddl_target_table};\n"
+        job_result: RowIterator = job.result(page_size=page_size)
+
+        if job.statement_type and job.statement_type not in ["SELECT"]:
+            message = f"'{job.statement_type}' done to {job.destination}. "
+            message += (
+                f"{row_cnt:,.0f} rows affected."
+                if (row_cnt := job.num_dml_affected_rows)
+                else ""
             )
-        elif job.dml_stats:
-            logger.success(
-                f"Deleted {job.dml_stats.deleted_row_count} row(s)\n"
-                if job.dml_stats.deleted_row_count
-                else f"Inserted {job.dml_stats.inserted_row_count} row(s)\n"
-                if job.dml_stats.inserted_row_count
-                else f"Updated {job.dml_stats.updated_row_count} row(s)\n"
-                if job.dml_stats.updated_row_count
-                else "No rows affected"
+            logger.success(message)
+            return {
+                "success": True,
+                "ddl_type": job.statement_type,
+                "rows_affected": job.num_dml_affected_rows,
+                "target_table": job.destination,
+            }
+        elif (output_row_cnt := job_result.total_rows) is not None:
+            message = f"Query completed and returned {output_row_cnt:,.0f} rows.\n" + (
+                f"Result stored in {job.destination.dataset_id}.{job.destination.table_id}\n"
+                if job.destination
+                else ""
             )
-        job_result: Iterator = job.result()
-        if is_checking_row_cnt:
-            pass
-        # get row count from job_result
-        elif output_row_cnt := job_result.total_rows:
-            logger.success(f"Query returned {output_row_cnt:,.0f} rows")
+            logger.success(message)
+        elif output_row_cnt == 0:
+            return {"success": True, "message": "Query completed with 0 rows returned."}
+
+        job_sample: RowIterator = job.result(max_results=sample_row_cnt)
+        job_sample_markdown: list[dict] = [dict(row) for row in job_sample]
+
+        if job_result.total_rows and job_result.total_rows <= 100000:
+            full_result = job_result.to_dataframe()
         else:
-            logger.success("Query completed without returning any rows")
-
-        # get temp table name
-
-        if not is_checking_row_cnt:
-            if job.destination:
-                temp_table = f"{job.destination.dataset_id}.{job.destination.table_id}"
-                logger.success(f"Query result stored in {temp_table}")
-
-            output_row_cnt = (
-                job_result.total_rows
-                or self.q(
-                    f"SELECT count(*) FROM {temp_table}", is_checking_row_cnt=True
-                ).iloc[0, 0]
+            qbar = tqdm(
+                total=job_result.total_rows, unit="rows", desc="Loading to dataframe"
             )
+            full_result = self._load_to_dataframe(job_result, qbar)
+            # full_result = asyncio.run(self._load_to_dataframe(job_result, qbar))
+        return {
+            "success": True,
+            "message": message,
+            "full_result": full_result,
+            "" "total_rows": job_result.total_rows,
+            "sample_result": job_sample_markdown,
+        }
 
-            if (
-                row_limit
-                and isinstance(output_row_cnt, int)
-                and output_row_cnt > row_limit
-            ):
-                return pd.DataFrame(
-                    [
-                        {
-                            "success": False,
-                            "error": "Row limit exceeded. Please reduce the number of rows returned by the sql or increase the row limit.",
-                            "output_row_cnt": output_row_cnt,
-                            "row_limit": row_limit,
-                        }
-                    ]
-                )
-        return job_result.to_dataframe()
+    def q(self, sql: str, project: Optional[str] = None) -> pd.DataFrame:
+        result = self._query(sql=sql, project=project)
+        full_result = result.get("full_result")
+        if full_result is None:
+            return pd.DataFrame(result, index=[0])
+        elif full_result.empty:
+            return pd.DataFrame()
+        return full_result
 
     def upload_df_to_bq(
         self,
@@ -174,14 +183,16 @@ class BigQuery:
         replace=False,
         specify_dtypes=False,
         batched=False,
+        silent: bool = False,
     ) -> None:
-        def upload(df_slice):
+        def upload(df_slice, silent):
             self.bq_service.upload_df_to_bq(
                 df_slice,
                 table_id=table_id,
                 dataset_id=dataset_id,
                 replace=replace,
                 schema=schema,
+                silent=silent,
             )
 
         if batched:
@@ -193,10 +204,10 @@ class BigQuery:
                 start = i * batch_size
                 end = start + batch_size
                 replace = replace if i == 0 else False
-                upload(df[start:end])
+                upload(df[start:end], silent)
         else:
             schema = self.get_schema(df, specify_dtypes)
-            upload(df)
+            upload(df, silent)
 
     def get_schema(
         self, df: pd.DataFrame, specify_dtypes: bool
@@ -249,6 +260,7 @@ class BigQuery:
             return {
                 "success": True,
                 "bytes_processed": job.total_bytes_processed,
+                "statement_type": job.statement_type,
             }
         except Exception as e:
             match = re.search(r"at \[(\d+):(\d+)\]", str(e))
@@ -259,21 +271,21 @@ class BigQuery:
                 char_no = int(char_no) - 1
                 sql_lines = sql.splitlines()
                 lines_to_show = 5
-                lines_bef = sql_lines[line_no - lines_to_show : line_no]
+                lines_bef = sql_lines[max(0, line_no - lines_to_show) : line_no]
                 lines_aft = sql_lines[line_no + 1 : line_no + lines_to_show]
                 line = sql_lines[line_no]
                 lines_colored = (
-                    f"{Fore.GREEN}"
+                    f"{Fore.LIGHTYELLOW_EX}"
                     f"{'\n'.join(lines_bef)}\n"
                     f"{line[:char_no]}"
                     f"{Fore.LIGHTRED_EX}{line[char_no:]}"
-                    f"{Fore.GREEN}\n"
+                    f"{Fore.LIGHTYELLOW_EX}\n"
                     f"{'\n'.join(lines_aft)}"
                     f"{Fore.RESET}"
                 )
-                error_to_print += f"\n{lines_colored}"
+                error_to_print += f"\n```\n{lines_colored}\n```\n"
             logger.error(error_to_print)
-            return {"success": False, "error": str(e), "sql": sql}
+            return {"success": False, "error": str(e)}
 
     def see_query_example(
         self,
@@ -298,6 +310,8 @@ class BigQuery:
             if destination_table_name
             else None
         )
+        # Filter out None values
+        table_filters = [filter for filter in table_filters if filter is not None]
         table_filters_str = "and " + (" and ".join(table_filters) or "1=1")
         keywords_filter = (
             f'and regexp_contains(query,r"(?i){keywords}")' if keywords else ""
@@ -309,18 +323,18 @@ class BigQuery:
         )
         df = self.q(
             rf"""
-            SELECT DISTINCT 
-                query,
-                COUNT(*) as cnt
-            FROM dev_dbda.bq_query_history_analysis
-            WHERE 1=1 
-            {dbda_filter}
-            {keywords_filter}
-            {table_filters_str}
-            AND regexp_contains(job_type_level2,r"(?i)scheduled_query|script_job")
-            GROUP BY All having cnt >= {min_run} 
-            ORDER BY cnt DESC limit {row_cnt}
-        """
+                SELECT DISTINCT 
+                    query,
+                    COUNT(*) as cnt
+                FROM dev_dbda.bq_query_history_analysis
+                WHERE 1=1 
+                {dbda_filter}
+                {keywords_filter}
+                {table_filters_str}
+                AND regexp_contains(job_type_level2,r"(?i)scheduled_query|script_job")
+                GROUP BY All having cnt >= {min_run} 
+                ORDER BY cnt DESC limit {row_cnt}
+            """
         )
         if df.empty and not is_nested:
             return self.see_query_example(
@@ -535,7 +549,7 @@ class BigQueryService:
         self.gservice = GService(
             service_key_path=service_key_path, service_key=service_key
         )
-        logger.success(
+        logger.info(
             f"initializing {self.__class__.__name__} with project {self.project}"
         )
         start_ts = time.time()
@@ -544,9 +558,7 @@ class BigQueryService:
         )
         self.client = bigquery.Client(project=project, credentials=self.credentials)
         duration = time.time() - start_ts
-        logger.success(
-            f"BigQuery client connected successfully in {duration:,.2f} seconds"
-        )
+        logger.success(f"BigQuery {self.project} connected in {duration:,.2f} seconds")
 
     def upload_df_to_bq(
         self,
@@ -556,6 +568,7 @@ class BigQueryService:
         project: Optional[str] = None,
         replace: bool = False,
         schema: Optional[list[bigquery.SchemaField]] = None,
+        silent: bool = False,
     ):  # -> "_AsyncJob"
         job_config = bigquery.LoadJobConfig(
             schema=schema,
@@ -567,9 +580,10 @@ class BigQueryService:
         job = self.client.load_table_from_dataframe(
             df, table_ref, job_config=job_config
         )
-        logger.success(
-            f"Uploaded to {project}:{dataset_id}.{table_id}: {df.shape[0]} rows and {df.shape[1]} columns; {df.memory_usage(deep=True).sum() / 1e6} MB"
-        )
+        if not silent:
+            logger.success(
+                f"Uploaded to {project}:{dataset_id}.{table_id}: {df.shape[0]} rows and {df.shape[1]} columns; {df.memory_usage(deep=True).sum() / 1e6} MB"
+            )
 
         return job.result()
 
