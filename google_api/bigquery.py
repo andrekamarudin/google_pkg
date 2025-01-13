@@ -1,17 +1,15 @@
-# import asyncio
-import json
 import os
-import platform
 import re
 import sys
 import time
 import warnings
-from datetime import datetime
+from datetime import timedelta
 from pathlib import Path
-from typing import Any, Optional
+from pprint import pformat
+from typing import Any, Optional, Set
 
+import numpy as np
 import pandas as pd
-import pytz
 from colorama import Fore, Style
 from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
@@ -89,8 +87,13 @@ class BigQuery:
             results.append(dict(row))
             qbar.update(1)
 
-    def _load_to_dataframe(self, job_result, qbar):
-        # async def _load_to_dataframe(self, job_result, qbar):
+    # async def _load_to_dataframe(self, job_result, qbar):
+    def _load_to_dataframe(self, job_result: RowIterator):
+        if job_result.total_rows and job_result.total_rows <= 100000:
+            return job_result.to_dataframe()
+        qbar = tqdm(
+            total=job_result.total_rows, unit="rows", desc="Loading to dataframe"
+        )
         results = []
         for page in job_result.pages:
             self._process_page(page, qbar, results)
@@ -104,27 +107,33 @@ class BigQuery:
         sql: str,
         project: Optional[str] = None,
         page_size: int = 50000,
-        sample_row_cnt: int = 5,
+        sample_row_cnt: Optional[int] = None,
     ) -> dict[str, Any]:
+        sample_row_cnt = sample_row_cnt or 5
         project = project or self.project
 
         dry_run_result = self._dry_run(sql, project)
         if not dry_run_result["success"]:
             return dry_run_result
         sql_extract = re.sub(r"[\s\n]+", " ", sql)[:50]
-        logger.success(
-            f"Dry run successful for `{sql_extract}`... Queueing & running query"
-        )
+        logger.success(f"Dry run successful for `{sql_extract}`.")
 
         if (query_size := dry_run_result["bytes_processed"] / 1e9) > 5:
             logger.warning(f"Query bytes: {query_size:,.2f} GB")
 
+        start_time: float = time.time()
         job: bigquery.QueryJob = self.client.query(sql)
 
-        job_result: RowIterator = job.result(page_size=page_size)
-
+        try:
+            job_result: RowIterator = job.result(page_size=page_size)
+        except Exception as e:
+            self._highlight_sql_error(e, sql)
+            return {"success": False, "error": str(e)}
+        duration = timedelta(seconds=round(time.time() - start_time))
         if job.statement_type and job.statement_type not in ["SELECT"]:
-            message = f"'{job.statement_type}' done to {job.destination}. "
+            message = (
+                f"'{job.statement_type}' done in {duration} to {job.destination}. "
+            )
             message += (
                 f"{row_cnt:,.0f} rows affected."
                 if (row_cnt := job.num_dml_affected_rows)
@@ -136,44 +145,69 @@ class BigQuery:
                 "ddl_type": job.statement_type,
                 "rows_affected": job.num_dml_affected_rows,
                 "target_table": job.destination,
+                "duration": duration,
             }
         elif (output_row_cnt := job_result.total_rows) is not None:
-            message = f"Query completed and returned {output_row_cnt:,.0f} rows.\n" + (
-                f"Result stored in {job.destination.dataset_id}.{job.destination.table_id}\n"
-                if job.destination
-                else ""
+            message = (
+                f"Query completed in {duration} seconds and returned {output_row_cnt:,.0f} rows.\n"
+                + (
+                    f"Result stored in {job.destination.dataset_id}.{job.destination.table_id}\n"
+                    if job.destination
+                    else ""
+                )
             )
             logger.success(message)
         elif output_row_cnt == 0:
-            return {"success": True, "message": "Query completed with 0 rows returned."}
+            return {
+                "success": True,
+                "message": "Query completed with 0 rows returned.",
+            }
 
         job_sample: RowIterator = job.result(max_results=sample_row_cnt)
         job_sample_markdown: list[dict] = [dict(row) for row in job_sample]
 
-        if job_result.total_rows and job_result.total_rows <= 100000:
-            full_result = job_result.to_dataframe()
-        else:
-            qbar = tqdm(
-                total=job_result.total_rows, unit="rows", desc="Loading to dataframe"
-            )
-            full_result = self._load_to_dataframe(job_result, qbar)
-            # full_result = asyncio.run(self._load_to_dataframe(job_result, qbar))
         return {
             "success": True,
             "message": message,
-            "full_result": full_result,
-            "" "total_rows": job_result.total_rows,
+            "job_result": job_result,
+            "total_rows": job_result.total_rows,
             "sample_result": job_sample_markdown,
+            "duration": duration,
         }
 
-    def q(self, sql: str, project: Optional[str] = None) -> pd.DataFrame:
-        result = self._query(sql=sql, project=project)
-        full_result = result.get("full_result")
+    def q(
+        self,
+        sql: str,
+        project: Optional[str] = None,
+        sample_row_cnt: Optional[int] = None,
+    ) -> pd.DataFrame:
+        result = self._query(sql=sql, project=project, sample_row_cnt=sample_row_cnt)
+        if "job_result" not in result:
+            return pd.DataFrame(result, index=[0])
+        full_result = (
+            self._load_to_dataframe(result["job_result"])
+            if not sample_row_cnt
+            else pd.DataFrame(result.get("sample_result"))
+        )
         if full_result is None:
             return pd.DataFrame(result, index=[0])
         elif full_result.empty:
             return pd.DataFrame()
         return full_result
+
+    def full_describe(self, df: pd.DataFrame) -> dict[str, dict]:
+        numeric_columns = df.select_dtypes(include=np.number).columns.to_list() or []
+        non_numeric_columns = [col for col in df.columns if col not in numeric_columns]
+        return {
+            "numeric_columns": (
+                (df[numeric_columns].describe().to_dict()) if numeric_columns else {}
+            ),
+            "non_numeric_columns": (
+                (df[non_numeric_columns].describe().to_dict())
+                if non_numeric_columns
+                else {}
+            ),
+        }
 
     def upload_df_to_bq(
         self,
@@ -183,6 +217,7 @@ class BigQuery:
         replace=False,
         specify_dtypes=False,
         batched=False,
+        schema=None,
         silent: bool = False,
     ) -> None:
         def upload(df_slice, silent):
@@ -206,7 +241,7 @@ class BigQuery:
                 replace = replace if i == 0 else False
                 upload(df[start:end], silent)
         else:
-            schema = self.get_schema(df, specify_dtypes)
+            schema = schema or self.get_schema(df, specify_dtypes)
             upload(df, silent)
 
     def get_schema(
@@ -263,29 +298,179 @@ class BigQuery:
                 "statement_type": job.statement_type,
             }
         except Exception as e:
-            match = re.search(r"at \[(\d+):(\d+)\]", str(e))
-            error_to_print = str(e)
-            if match:
-                line_no, char_no = match.groups()
-                line_no = int(line_no) - 1
-                char_no = int(char_no) - 1
-                sql_lines = sql.splitlines()
-                lines_to_show = 5
-                lines_bef = sql_lines[max(0, line_no - lines_to_show) : line_no]
-                lines_aft = sql_lines[line_no + 1 : line_no + lines_to_show]
-                line = sql_lines[line_no]
-                lines_colored = (
-                    f"{Fore.LIGHTYELLOW_EX}"
-                    f"{'\n'.join(lines_bef)}\n"
-                    f"{line[:char_no]}"
-                    f"{Fore.LIGHTRED_EX}{line[char_no:]}"
-                    f"{Fore.LIGHTYELLOW_EX}\n"
-                    f"{'\n'.join(lines_aft)}"
-                    f"{Fore.RESET}"
-                )
-                error_to_print += f"\n```\n{lines_colored}\n```\n"
-            logger.error(error_to_print)
+            self._highlight_sql_error(e, sql)
             return {"success": False, "error": str(e)}
+
+    def _highlight_sql_error(self, error, sql: str) -> str:
+        match = re.search(r"at \[(\d+):(\d+)\]", str(error))
+        error_to_print = pformat(str(error))
+        if match and "failed to parse view" not in error_to_print:
+            line_no, char_no = match.groups()
+            line_no = int(line_no) - 1
+            char_no = int(char_no) - 1
+            sql_lines = sql.splitlines()
+            lines_to_show = 5
+            lines_bef = sql_lines[max(0, line_no - lines_to_show) : line_no]
+            lines_aft = sql_lines[line_no + 1 : line_no + lines_to_show]
+            line = sql_lines[line_no]
+            lines_colored = (
+                f"{Fore.LIGHTYELLOW_EX}"
+                f"{'\n'.join(lines_bef)}\n"
+                f"{line[:char_no]}"
+                f"{Fore.LIGHTRED_EX}{line[char_no:]}"
+                f"{Fore.LIGHTYELLOW_EX}\n"
+                f"{'\n'.join(lines_aft)}"
+                f"{Fore.RESET}"
+            )
+            error_to_print += f"\n{lines_colored}\n"
+        logger.error(error_to_print)
+        match = re.search(r"at \[(\d+):(\d+)\]", str(error))
+        return error_to_print
+
+    def drop_dataset(self, dataset_id: str, project: Optional[str] = None) -> None:
+        project = project or self.project
+        self.client.delete_dataset(dataset_id, delete_contents=True, not_found_ok=True)
+        logger.success(f"Dataset `{project}:{dataset_id}` dropped successfully")
+        return
+
+    def drop_table(
+        self, table_id: str, dataset_id: str, project: Optional[str] = None
+    ) -> None:
+        project = project or self.project
+        table_ref = self.bq_service.get_table(table_id, dataset_id, project)
+        self.client.delete_table(table_ref, not_found_ok=True)
+        logger.success(
+            f"Table `{project}:{dataset_id}.{table_id}` dropped successfully"
+        )
+        return
+
+    def get_table_schema(
+        self,
+        table_id: str,
+        dataset_id: str,
+        project: Optional[str] = None,
+    ) -> dict[str, str]:
+        result = self._query(
+            rf"""
+            SELECT *
+            FROM `{project}`.{dataset_id}.INFORMATION_SCHEMA.COLUMNS
+            WHERE table_name = '{table_id}';
+            """
+        )
+        df = self._load_to_dataframe(result["job_result"])
+        result = {
+            f"{row['column_name']}: ({row['data_type']}){' is_partitioning_column' if row['is_partitioning_column']=='YES' else ''}"
+            for _, row in df.iterrows()
+        }
+        return result
+
+    def search_datasets(
+        self,
+        dataset_keyword: Optional[str] = None,
+        project: Optional[str] = None,
+    ) -> list[str]:
+        project = project or self.project
+        datasets = self.client.list_datasets(project=project)
+        return [
+            dataset.dataset_id
+            for dataset in datasets
+            if not dataset_keyword or re.search(dataset_keyword, dataset.dataset_id)
+        ]
+
+    def search_tables(
+        self,
+        table_keyword: Optional[str] = None,
+        dataset_keyword: Optional[str] = None,
+        project: Optional[str] = None,
+    ) -> list[str]:
+        project = project or self.project
+        dataset_id_list = self.search_datasets(dataset_keyword, project)
+        return [
+            f"`{project}`.{next_dataset_id}.{table.table_id}"
+            for next_dataset_id in dataset_id_list
+            for table in list(
+                self.client.list_tables(self.client.dataset(next_dataset_id, project))
+            )
+            if not table_keyword or re.search(table_keyword, table.table_id)
+        ]
+
+    def q_database_tables(
+        self,
+        column_keyword: Optional[str] = None,
+        table_keyword: Optional[str] = None,
+        dataset_keyword: Optional[str] = None,
+    ) -> Set[str]:
+        df = self.q_database_index(
+            column_keyword=column_keyword,
+            table_keyword=table_keyword,
+            dataset_keyword=dataset_keyword,
+        )
+        return set(df["table_id"])
+
+    # fairprice-bigquery specific
+    def q_database_index(
+        self,
+        column_keyword: Optional[str] = None,
+        table_keyword: Optional[str] = None,
+        dataset_keyword: Optional[str] = None,
+    ) -> pd.DataFrame:
+        assert (
+            self.project == "fairprice-bigquery"
+        ), "Not implemented for projects other than fairprice-bigquery."
+        assert (
+            column_keyword or dataset_keyword or table_keyword
+        ), "At least one keyword must be provided."
+        col_filter = (
+            f"AND REGEXP_CONTAINS(column_name,r'(?i){column_keyword}')"
+            if column_keyword
+            else ""
+        )
+        dataset_filter = (
+            f"AND REGEXP_CONTAINS(table_schema,r'(?i){dataset_keyword}')"
+            if dataset_keyword
+            else ""
+        )
+        table_filter = (
+            f"AND REGEXP_CONTAINS(table_name,r'(?i){table_keyword}')"
+            if table_keyword
+            else ""
+        )
+        sql = f"""
+            SELECT DISTINCT  
+                table_id, 
+                column_name,
+                data_type,
+                STRING_AGG(if(is_partitioning_column='YES',column_name,Null),', ')
+                 over(PARTITION BY table_id) as table_partitioning_columns,
+            FROM ads_dbda.db_database_index
+            WHERE 1=1 
+            {col_filter}
+            {dataset_filter}
+            {table_filter}
+            ORDER BY 1,2,3
+        """
+        return self.q(sql)
+
+    def q_last_modified(
+        self,
+        table_id: str,
+        dataset_id: str,
+        project: Optional[str] = None,
+    ) -> pd.Timestamp:
+        project = project or self.project
+        results = self.q(f"""
+        SELECT TIMESTAMP_MILLIS(last_modified_time) AS last_modified
+        FROM `{project}.{dataset_id}.__TABLES__`,
+        UNNEST([table_id = "{table_id}"]) AS is_exact_match,
+        UNNEST([table_id LIKE "{table_id}%"]) AS is_like_match
+        WHERE 1=1 
+            AND is_like_match
+        ORDER BY is_exact_match DESC, last_modified DESC
+        LIMIT 1
+        """)
+        if results.empty:
+            logger.warning(f"No results found for table {table_id}")
+        return results["last_modified"][0]
 
     def see_query_example(
         self,
@@ -331,6 +516,7 @@ class BigQuery:
                 {dbda_filter}
                 {keywords_filter}
                 {table_filters_str}
+                AND creation_date >= date_add(current_date("+8"),interval -2 month)
                 AND regexp_contains(job_type_level2,r"(?i)scheduled_query|script_job")
                 GROUP BY All having cnt >= {min_run} 
                 ORDER BY cnt DESC limit {row_cnt}
@@ -348,167 +534,13 @@ class BigQuery:
                 dbda_only=False,
                 is_nested=True,
             )
+        if "query" not in df.columns:
+            return [df.to_markdown()]
 
-        query_list = df["query"].tolist()
+        return df["query"].tolist()
 
-        return query_list
-
-    def drop_dataset(self, dataset_id: str, project: Optional[str] = None) -> None:
-        project = project or self.project
-        self.client.delete_dataset(dataset_id, delete_contents=True, not_found_ok=True)
-        logger.success(f"Dataset `{project}:{dataset_id}` dropped successfully")
-        return
-
-    def drop_table(
-        self, table_id: str, dataset_id: str, project: Optional[str] = None
-    ) -> None:
-        project = project or self.project
-        table_ref = self.bq_service.get_table(table_id, dataset_id, project)
-        self.client.delete_table(table_ref, not_found_ok=True)
-        logger.success(
-            f"Table `{project}:{dataset_id}.{table_id}` dropped successfully"
-        )
-        return
-
-    def q_database_index(
-        self,
-        column_keyword: Optional[str] = None,
-        table_keyword: Optional[str] = None,
-        dataset_keyword: Optional[str] = None,
-    ) -> pd.DataFrame:
-        assert (
-            self.project == "fairprice-bigquery"
-        ), "Not implemented for projects other than fairprice-bigquery."
-        assert (
-            column_keyword or dataset_keyword or table_keyword
-        ), "At least one keyword must be provided."
-        col_filter = (
-            f"AND REGEXP_CONTAINS(column_name,r'(?i){column_keyword}')"
-            if column_keyword
-            else ""
-        )
-        dataset_filter = (
-            f"AND REGEXP_CONTAINS(table_schema,r'(?i){dataset_keyword}')"
-            if dataset_keyword
-            else ""
-        )
-        table_filter = (
-            f"AND REGEXP_CONTAINS(table_name,r'(?i){table_keyword}')"
-            if table_keyword
-            else ""
-        )
-        sql = f"""
-            SELECT DISTINCT  
-                table_id, 
-                column_name,
-                data_type,
-                STRING_AGG(if(is_partitioning_column='YES',column_name,Null),', ')
-                 over(PARTITION BY table_id) as table_partitioning_columns,
-            FROM ads_dbda.db_database_index
-            WHERE 1=1 
-            {col_filter}
-            {dataset_filter}
-            {table_filter}
-            ORDER BY 1,2,3
-        """
-        return self.q(sql)
-
-    def get_table_sample_rows(
-        self,
-        table_keyword: str,
-        dataset_keyword: Optional[str] = None,
-    ) -> dict[str, pd.DataFrame]:
-        assert (
-            self.project == "fairprice-bigquery"
-        ), "Not implemented for projects other than fairprice-bigquery."
-        metadata = self.q_database_index(
-            table_keyword=table_keyword,
-            dataset_keyword=dataset_keyword,
-        )
-        unique_table_ids = set(metadata["table_id"])
-        assert len(unique_table_ids) <= 3, f"Too many tables found: {unique_table_ids}"
-        table_partition_col_mapping: dict[str, list[str]] = {}
-        for table_id in unique_table_ids:
-            partitions = metadata[
-                (metadata["table_id"] == table_id)
-                & (metadata["is_partitioning_column"])
-            ]
-            table_partition_col_mapping[table_id] = partitions["column_name"].tolist()
-
-        results = {}
-        for table_id in unique_table_ids:
-            first_partition_col = table_partition_col_mapping[table_id][0]
-            max_partition = self.q(
-                rf"""
-                SELECT MAX({first_partition_col}) AS max_partition
-                FROM `{table_id}`
-                """
-            ).iloc[0]["max_partition"]
-            df = self.q(
-                f"""
-            SELECT * FROM `{table_id}`
-            where concat({first_partition_col}) = '{max_partition}'
-            limit 5
-            """
-            )
-            results[table_id] = df.to_markdown()
-        return results
-
-    def q_last_modified(
-        self,
-        table_id: str,
-        dataset_id: str,
-        project: Optional[str] = None,
-    ) -> pd.Timestamp:
-        project = project or self.project
-        results = self.q(f"""
-        SELECT TIMESTAMP_MILLIS(last_modified_time) AS last_modified
-        FROM `{project}.{dataset_id}.__TABLES__`,
-        UNNEST([table_id = "{table_id}"]) AS is_exact_match,
-        UNNEST([table_id LIKE "{table_id}%"]) AS is_like_match
-        WHERE 1=1 
-            AND is_like_match
-        ORDER BY is_exact_match DESC, last_modified DESC
-        LIMIT 1
-        """)
-        if results.empty:
-            logger.warning(f"No results found for table {table_id}")
-        return results["last_modified"][0]
-
-    def list_table_by_keyword(
-        self,
-        keyword: Optional[str] = None,
-        dataset_id: Optional[str] = None,
-        project: Optional[str] = None,
-    ) -> list:
-        project = project or self.project
-        if dataset_id:
-            dataset_ref = self.bq_service.ensure_dataset(dataset_id, project)
-            tables = list(self.client.list_tables(dataset_ref))
-        else:
-            datasets = self.client.list_datasets()
-            tables = []
-            for dataset in datasets:
-                dataset_ref = self.client.dataset(dataset.dataset_id, project)
-                tables += list(self.client.list_tables(dataset_ref))
-        table_names = [
-            table.full_table_id
-            for table in tables
-            if not keyword or keyword in table.table_id
-        ]
-        logger.success(f"{len(table_names)} tables found.")
-        return table_names
-
-    def list_dataset_by_keyword(self, keyword, project=None):
-        project = project or self.project
-        datasets = self.client.list_datasets()
-        datasets = [
-            dataset.full_dataset_id
-            for dataset in datasets
-            if keyword in dataset.dataset_id
-        ]
-        logger.success(f"{len(datasets)} datasets found.")
-        return datasets
+    def indent_query(self, query: str, indent: str = "    ") -> str:
+        return "".join(indent + line for line in query.splitlines(keepends=True))
 
 
 class BigQueryService:
@@ -567,10 +599,11 @@ class BigQueryService:
         dataset_id: str,
         project: Optional[str] = None,
         replace: bool = False,
-        schema: Optional[list[bigquery.SchemaField]] = None,
         silent: bool = False,
+        schema: Optional[list[bigquery.SchemaField]] = None,
+        job_config: Optional[bigquery.LoadJobConfig] = None,
     ):  # -> "_AsyncJob"
-        job_config = bigquery.LoadJobConfig(
+        job_config = job_config or bigquery.LoadJobConfig(
             schema=schema,
             write_disposition="WRITE_TRUNCATE" if replace else "WRITE_APPEND",
         )
