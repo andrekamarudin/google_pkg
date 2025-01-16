@@ -20,12 +20,21 @@ from tqdm import tqdm
 
 from google_api.packages.gservice import GService, ServiceKey
 
-warnings.filterwarnings(
-    "ignore",
-    message="BigQuery Storage module not found, fetch data with the REST endpoint instead.",
-    category=UserWarning,
-    module="google.cloud.bigquery.table",
-)
+# Define warnings to filter
+WARNINGS_TO_FILTER = [
+    {"message": "To exit: use 'exit', 'quit', or Ctrl-D.", "category": None},
+    {
+        "message": "BigQuery Storage module not found, fetch data with the REST endpoint instead.",
+        "category": UserWarning,
+        "module": "google.cloud.bigquery.table",
+    },
+]
+for warning in WARNINGS_TO_FILTER:
+    kwargs = {k: v for k, v in warning.items() if v is not None}
+    # Use regex pattern matching for messages
+    if "message" in kwargs:
+        kwargs["message"] = f"^{kwargs['message']}$"
+    warnings.filterwarnings("ignore", **kwargs)
 
 logger.remove()
 LOG_FMT = "<level>{level}: {message}</level> <black>({file} / {module} / {function} / {line})</black>"
@@ -107,38 +116,43 @@ class BigQuery:
         sql: str,
         project: Optional[str] = None,
         page_size: int = 50000,
-        sample_row_cnt: Optional[int] = None,
+        sample_row_cnt: Optional[int] = 100000,
+        wait_for_results: bool = True,
     ) -> dict[str, Any]:
-        sample_row_cnt = sample_row_cnt or 5
         project = project or self.project
 
         dry_run_result = self._dry_run(sql, project)
         if not dry_run_result["success"]:
+            raise SystemExit
             return dry_run_result
-        sql_extract = re.sub(r"[\s\n]+", " ", sql)[:50]
-        logger.success(f"Dry run successful for `{sql_extract}`.")
+        sql_extract = re.sub(r"[\s\n]+", " ", sql)[:150]
 
         if (query_size := dry_run_result["bytes_processed"] / 1e9) > 5:
             logger.warning(f"Query bytes: {query_size:,.2f} GB")
 
+        logger.success(sql_extract)
         start_time: float = time.time()
         job: bigquery.QueryJob = self.client.query(sql)
+        if not wait_for_results:
+            return {"success": True, "job": job}
 
         try:
             job_result: RowIterator = job.result(page_size=page_size)
         except Exception as e:
             self._highlight_sql_error(e, sql)
+            raise SystemExit
             return {"success": False, "error": str(e)}
         duration = timedelta(seconds=round(time.time() - start_time))
+        message = f"'{job.statement_type}' done in {duration}. "
+
+        # if job_result.total_rows == 0:
+        #     # no rows returned
+        #     return {"success": True, "message": f"{message}\nNo rows returned."}
         if job.statement_type and job.statement_type not in ["SELECT"]:
-            message = (
-                f"'{job.statement_type}' done in {duration} to {job.destination}. "
-            )
-            message += (
-                f"{row_cnt:,.0f} rows affected."
-                if (row_cnt := job.num_dml_affected_rows)
-                else ""
-            )
+            # DDL or DML
+            if row_cnt := job.num_dml_affected_rows:
+                message += f"\n{row_cnt:,.0f} rows affected."
+                message += f"Result stored in {job.destination}"
             logger.success(message)
             return {
                 "success": True,
@@ -147,31 +161,24 @@ class BigQuery:
                 "target_table": job.destination,
                 "duration": duration,
             }
-        elif (output_row_cnt := job_result.total_rows) is not None:
-            message = (
-                f"Query completed in {duration} seconds and returned {output_row_cnt:,.0f} rows.\n"
-                + (
-                    f"Result stored in {job.destination.dataset_id}.{job.destination.table_id}\n"
-                    if job.destination
-                    else ""
-                )
+        elif job_result.total_rows is not None:
+            # SELECT query
+            message += (
+                f"\nResult stored in {job.destination.dataset_id}.{job.destination.table_id}\n"
+                if job.destination
+                else ""
             )
             logger.success(message)
-        elif output_row_cnt == 0:
-            return {
-                "success": True,
-                "message": "Query completed with 0 rows returned.",
-            }
 
         job_sample: RowIterator = job.result(max_results=sample_row_cnt)
-        job_sample_markdown: list[dict] = [dict(row) for row in job_sample]
+        sample_result: list[dict] = [dict(row) for row in job_sample]
 
         return {
             "success": True,
             "message": message,
             "job_result": job_result,
             "total_rows": job_result.total_rows,
-            "sample_result": job_sample_markdown,
+            "sample_result": sample_result,
             "duration": duration,
         }
 
@@ -179,21 +186,45 @@ class BigQuery:
         self,
         sql: str,
         project: Optional[str] = None,
-        sample_row_cnt: Optional[int] = None,
+        sample_row_cnt: int = 100000,
+        wait_for_results: bool = True,
     ) -> pd.DataFrame:
-        result = self._query(sql=sql, project=project, sample_row_cnt=sample_row_cnt)
-        if "job_result" not in result:
-            return pd.DataFrame(result, index=[0])
-        full_result = (
-            self._load_to_dataframe(result["job_result"])
-            if not sample_row_cnt
-            else pd.DataFrame(result.get("sample_result"))
+        """
+        Run a query and return the results as a DataFrame.
+        :param sql: SQL query to run
+        :param project: Project to run the query in
+        :param sample_row_cnt: Number of rows to sample from the query result. Default 100k rows. If 0, return all rows.
+        :param wait_for_results: Whether to wait for the query to complete
+        :return: DataFrame containing the query results
+        """
+        result = self._query(
+            sql=sql,
+            project=project,
+            sample_row_cnt=sample_row_cnt,
+            wait_for_results=wait_for_results,
         )
-        if full_result is None:
-            return pd.DataFrame(result, index=[0])
-        elif full_result.empty:
+
+        if not wait_for_results:
             return pd.DataFrame()
-        return full_result
+        elif "job_result" not in result:
+            return pd.DataFrame(result, index=[0])
+
+        total_rows = result.get("total_rows", 0)
+        if sample_row_cnt == 0 or (total_rows <= sample_row_cnt):
+            # unlimited rows or within limit
+            final_result = self._load_to_dataframe(result["job_result"])
+        else:
+            #  exceeded the limit
+            logger.error(
+                f"Query returned {total_rows} rows, which is over the limit set. Retrieving only the first {sample_row_cnt} rows. Set sample_row_cnt=0 to retrieve all rows."
+            )
+            final_result = pd.DataFrame(result.get("sample_result"))
+
+        if final_result is None:
+            return pd.DataFrame(result, index=[0])
+        elif final_result.empty:
+            return pd.DataFrame()
+        return final_result
 
     def full_describe(self, df: pd.DataFrame) -> dict[str, dict]:
         numeric_columns = df.select_dtypes(include=np.number).columns.to_list() or []
@@ -269,7 +300,7 @@ class BigQuery:
                 print("Please select the data type from the following options:")
                 print(Fore.LIGHTBLACK_EX, end="")
                 for i, dtype in enumerate(common_dtypes):
-                    print(f"{i+1}. {dtype}")
+                    print(f"{i + 1}. {dtype}")
                 user_input = input(
                     f"Enter the number corresponding to the data type: {Fore.GREEN}"
                 )
@@ -349,7 +380,7 @@ class BigQuery:
         table_id: str,
         dataset_id: str,
         project: Optional[str] = None,
-    ) -> dict[str, str]:
+    ) -> set[str]:
         result = self._query(
             rf"""
             SELECT *
@@ -357,12 +388,14 @@ class BigQuery:
             WHERE table_name = '{table_id}';
             """
         )
+        if not result["success"]:
+            return set()
         df = self._load_to_dataframe(result["job_result"])
-        result = {
-            f"{row['column_name']}: ({row['data_type']}){' is_partitioning_column' if row['is_partitioning_column']=='YES' else ''}"
+        tables: Set[str] = {
+            f"{row['column_name']}: ({row['data_type']}){' is_partitioning_column' if row['is_partitioning_column'] == 'YES' else ''}"
             for _, row in df.iterrows()
         }
-        return result
+        return tables
 
     def search_datasets(
         self,
@@ -414,12 +447,12 @@ class BigQuery:
         table_keyword: Optional[str] = None,
         dataset_keyword: Optional[str] = None,
     ) -> pd.DataFrame:
-        assert (
-            self.project == "fairprice-bigquery"
-        ), "Not implemented for projects other than fairprice-bigquery."
-        assert (
-            column_keyword or dataset_keyword or table_keyword
-        ), "At least one keyword must be provided."
+        assert self.project == "fairprice-bigquery", (
+            "Not implemented for projects other than fairprice-bigquery."
+        )
+        assert column_keyword or dataset_keyword or table_keyword, (
+            "At least one keyword must be provided."
+        )
         col_filter = (
             f"AND REGEXP_CONTAINS(column_name,r'(?i){column_keyword}')"
             if column_keyword
