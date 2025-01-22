@@ -163,8 +163,9 @@ class BigQuery:
             }
         elif job_result.total_rows is not None:
             # SELECT query
+            message += f"\n{job_result.total_rows:,.0f} rows returned"
             message += (
-                f"\nResult stored in {job.destination.dataset_id}.{job.destination.table_id}\n"
+                f" and stored in {job.destination.dataset_id}.{job.destination.table_id}\n"
                 if job.destination
                 else ""
             )
@@ -447,12 +448,12 @@ class BigQuery:
         table_keyword: Optional[str] = None,
         dataset_keyword: Optional[str] = None,
     ) -> pd.DataFrame:
-        assert self.project == "fairprice-bigquery", (
-            "Not implemented for projects other than fairprice-bigquery."
-        )
-        assert column_keyword or dataset_keyword or table_keyword, (
-            "At least one keyword must be provided."
-        )
+        assert (
+            self.project == "fairprice-bigquery"
+        ), "Not implemented for projects other than fairprice-bigquery."
+        assert (
+            column_keyword or dataset_keyword or table_keyword
+        ), "At least one keyword must be provided."
         col_filter = (
             f"AND REGEXP_CONTAINS(column_name,r'(?i){column_keyword}')"
             if column_keyword
