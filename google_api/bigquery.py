@@ -77,6 +77,8 @@ class BigQuery:
 
         if service_key_path:
             pass
+        elif self.project == "ne-fprt-data-cloud-production":
+            service_key_path = os.getenv("CIA_GOOGLE_APPLICATION_CREDENTIALS")
         elif self.project == "fairprice-bigquery":
             service_key_path = os.getenv("DBDA_GOOGLE_APPLICATION_CREDENTIALS")
         else:
@@ -111,6 +113,15 @@ class BigQuery:
         qbar.close()
         return pd.DataFrame(results)
 
+    def wait_for_job(
+        self,
+        job: bigquery.QueryJob,
+        *args,
+        **kwargs,
+    ) -> RowIterator:
+        result = job.result()
+        return result
+
     def _query(
         self,
         sql: str,
@@ -118,13 +129,15 @@ class BigQuery:
         page_size: int = 50000,
         sample_row_cnt: Optional[int] = 100000,
         wait_for_results: bool = True,
+        *args,
+        **kwargs,
     ) -> dict[str, Any]:
         project = project or self.project
 
         dry_run_result = self._dry_run(sql, project)
         if not dry_run_result["success"]:
-            raise SystemExit
-            return dry_run_result
+            logger.warning(pformat(dry_run_result))
+            raise dry_run_result["error_obj"]
         sql_extract = re.sub(r"[\s\n]+", " ", sql)[:150]
 
         if (query_size := dry_run_result["bytes_processed"] / 1e9) > 5:
@@ -140,7 +153,7 @@ class BigQuery:
             job_result: RowIterator = job.result(page_size=page_size)
         except Exception as e:
             self._highlight_sql_error(e, sql)
-            raise SystemExit
+            raise e
             return {"success": False, "error": str(e)}
         duration = timedelta(seconds=round(time.time() - start_time))
         message = f"'{job.statement_type}' done in {duration}. "
@@ -331,7 +344,11 @@ class BigQuery:
             }
         except Exception as e:
             self._highlight_sql_error(e, sql)
-            return {"success": False, "error": str(e)}
+            return {
+                "success": False,
+                "error": str(e),
+                "error_obj": e,
+            }
 
     def _highlight_sql_error(self, error, sql: str) -> str:
         match = re.search(r"at \[(\d+):(\d+)\]", str(error))
@@ -345,14 +362,15 @@ class BigQuery:
             lines_bef = sql_lines[max(0, line_no - lines_to_show) : line_no]
             lines_aft = sql_lines[line_no + 1 : line_no + lines_to_show]
             line = sql_lines[line_no]
+            lb = "\n"
             lines_colored = (
-                f"{Fore.LIGHTYELLOW_EX}"
-                f"{'\n'.join(lines_bef)}\n"
-                f"{line[:char_no]}"
-                f"{Fore.LIGHTRED_EX}{line[char_no:]}"
-                f"{Fore.LIGHTYELLOW_EX}\n"
-                f"{'\n'.join(lines_aft)}"
-                f"{Fore.RESET}"
+                rf"{Fore.LIGHTYELLOW_EX}"
+                rf"{lb.join(lines_bef)}{lb}"
+                rf"{line[:char_no]}"
+                rf"{Fore.LIGHTRED_EX}{line[char_no:]}"
+                rf"{Fore.LIGHTYELLOW_EX}{lb}"
+                rf"{lb.join(lines_aft)}"
+                rf"{Fore.RESET}"
             )
             error_to_print += f"\n{lines_colored}\n"
         logger.error(error_to_print)
