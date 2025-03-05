@@ -63,34 +63,38 @@ class BigQuery:
         service_key_path: Optional[Path | str] = None,
         service_key: Optional[ServiceKey] = None,
     ):
-        self.project = project or os.getenv("BIGQUERY_DEFAULT_PROJECT")
-        if not self.project:
-            raise Exception("Project not specified nor found in environment variables")
-        if hasattr(self, "initialized"):
-            logger.info(
-                f"{self.__class__.__name__} already initialized for {self.project}"
+        try:
+            self.project = project or os.getenv("BIGQUERY_DEFAULT_PROJECT")
+            if not self.project:
+                raise Exception("Project not specified nor found in environment variables")
+            if hasattr(self, "initialized"):
+                logger.info(
+                    f"{self.__class__.__name__} already initialized for {self.project}"
+                )
+                return
+            self.initialized = True
+
+            logger.info(f"Initializing {self.__class__.__name__} for {self.project}")
+
+            if service_key_path:
+                pass
+            elif self.project == "ne-fprt-data-cloud-production":
+                service_key_path = os.getenv("CIA_GOOGLE_APPLICATION_CREDENTIALS")
+            elif self.project == "fairprice-bigquery":
+                service_key_path = os.getenv("DBDA_GOOGLE_APPLICATION_CREDENTIALS")
+            else:
+                service_key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            self.bq_service = BigQueryService(
+                self,
+                project=project,
+                location=location,
+                service_key_path=service_key_path,
+                service_key=service_key,
             )
-            return
-        self.initialized = True
-
-        logger.info(f"Initializing {self.__class__.__name__} for {self.project}")
-
-        if service_key_path:
-            pass
-        elif self.project == "ne-fprt-data-cloud-production":
-            service_key_path = os.getenv("CIA_GOOGLE_APPLICATION_CREDENTIALS")
-        elif self.project == "fairprice-bigquery":
-            service_key_path = os.getenv("DBDA_GOOGLE_APPLICATION_CREDENTIALS")
-        else:
-            service_key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        self.bq_service = BigQueryService(
-            self,
-            project=project,
-            location=location,
-            service_key_path=service_key_path,
-            service_key=service_key,
-        )
-        self.client = self.bq_service.client
+            self.client = self.bq_service.client
+        except Exception as e:
+            self.__class__._instances.pop(self.project, None)
+            raise e
 
     # async def _process_page(self, page, qbar, results):
     def _process_page(self, page, qbar, results):
