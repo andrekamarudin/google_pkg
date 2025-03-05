@@ -1,13 +1,13 @@
 [tool.poetry]
 name = "google-api"
-version = "1.5.8"
+version = "1.5.9"
 description = "Package to interact with various Google APIs"
 authors = ["Andre <andre.kamarudin@fairprice.com.sg>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
 python = ">=3.10,<4.0"
-pyarrow = "<=17.0.0"
+pyarrow = ">=17.0.0,<20.0.0"
 google-api-python-client = ">=2.0.0,<3.0.0"
 google-api-core = ">=2.0.0,<3.0.0"
 google-cloud-bigquery = ">=3.0.0,<4.0.0"
