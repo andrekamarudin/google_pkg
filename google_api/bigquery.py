@@ -63,34 +63,40 @@ class BigQuery:
         service_key_path: Optional[Path | str] = None,
         service_key: Optional[ServiceKey] = None,
     ):
-        self.project = project or os.getenv("BIGQUERY_DEFAULT_PROJECT")
-        if not self.project:
-            raise Exception("Project not specified nor found in environment variables")
-        if hasattr(self, "initialized"):
-            logger.info(
-                f"{self.__class__.__name__} already initialized for {self.project}"
+        try:
+            self.project = project or os.getenv("BIGQUERY_DEFAULT_PROJECT")
+            if not self.project:
+                raise Exception(
+                    "Project not specified nor found in environment variables"
+                )
+            if hasattr(self, "initialized"):
+                logger.info(
+                    f"{self.__class__.__name__} already initialized for {self.project}"
+                )
+                return
+            self.initialized = True
+
+            logger.info(f"Initializing {self.__class__.__name__} for {self.project}")
+
+            if service_key_path:
+                pass
+            elif self.project == "ne-fprt-data-cloud-production":
+                service_key_path = os.getenv("CIA_GOOGLE_APPLICATION_CREDENTIALS")
+            elif self.project == "fairprice-bigquery":
+                service_key_path = os.getenv("DBDA_GOOGLE_APPLICATION_CREDENTIALS")
+            else:
+                service_key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            self.bq_service = BigQueryService(
+                self,
+                project=project,
+                location=location,
+                service_key_path=service_key_path,
+                service_key=service_key,
             )
-            return
-        self.initialized = True
-
-        logger.info(f"Initializing {self.__class__.__name__} for {self.project}")
-
-        if service_key_path:
-            pass
-        elif self.project == "ne-fprt-data-cloud-production":
-            service_key_path = os.getenv("CIA_GOOGLE_APPLICATION_CREDENTIALS")
-        elif self.project == "fairprice-bigquery":
-            service_key_path = os.getenv("DBDA_GOOGLE_APPLICATION_CREDENTIALS")
-        else:
-            service_key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        self.bq_service = BigQueryService(
-            self,
-            project=project,
-            location=location,
-            service_key_path=service_key_path,
-            service_key=service_key,
-        )
-        self.client = self.bq_service.client
+            self.client = self.bq_service.client
+        except Exception as e:
+            self.__class__._instances.pop(self.project, None)
+            raise SystemExit(e)
 
     # async def _process_page(self, page, qbar, results):
     def _process_page(self, page, qbar, results):
@@ -137,7 +143,7 @@ class BigQuery:
         dry_run_result = self._dry_run(sql, project)
         if not dry_run_result["success"]:
             logger.warning(pformat(dry_run_result))
-            raise dry_run_result["error_obj"]
+            raise SystemExit(dry_run_result["error_obj"])
         sql_extract = re.sub(r"[\s\n]+", " ", sql)[:150]
 
         if (query_size := dry_run_result["bytes_processed"] / 1e9) > 5:
@@ -153,7 +159,7 @@ class BigQuery:
             job_result: RowIterator = job.result(page_size=page_size)
         except Exception as e:
             self._highlight_sql_error(e, sql)
-            raise e
+            raise SystemExit(e)
             return {"success": False, "error": str(e)}
         duration = timedelta(seconds=round(time.time() - start_time))
         message = f"'{job.statement_type}' done in {duration}. "
@@ -260,6 +266,7 @@ class BigQuery:
         table_id,
         dataset_id,
         replace=False,
+        job_config=None,
         specify_dtypes=False,
         batched=False,
         schema=None,
@@ -273,6 +280,7 @@ class BigQuery:
                 replace=replace,
                 schema=schema,
                 silent=silent,
+                job_config=job_config,
             )
 
         if batched:
@@ -466,12 +474,12 @@ class BigQuery:
         table_keyword: Optional[str] = None,
         dataset_keyword: Optional[str] = None,
     ) -> pd.DataFrame:
-        assert (
-            self.project == "fairprice-bigquery"
-        ), "Not implemented for projects other than fairprice-bigquery."
-        assert (
-            column_keyword or dataset_keyword or table_keyword
-        ), "At least one keyword must be provided."
+        assert self.project == "fairprice-bigquery", (
+            "Not implemented for projects other than fairprice-bigquery."
+        )
+        assert column_keyword or dataset_keyword or table_keyword, (
+            "At least one keyword must be provided."
+        )
         col_filter = (
             f"AND REGEXP_CONTAINS(column_name,r'(?i){column_keyword}')"
             if column_keyword
@@ -524,7 +532,7 @@ class BigQuery:
             logger.warning(f"No results found for table {table_id}")
         return results["last_modified"][0]
 
-    def see_query_example(
+    def see_scheduled_query_example(
         self,
         destination_table_name: str,
         destination_dataset_name: str,
@@ -550,6 +558,26 @@ class BigQuery:
         # Filter out None values
         table_filters = [filter for filter in table_filters if filter is not None]
         table_filters_str = "and " + (" and ".join(table_filters) or "1=1")
+        return self.see_query_example(
+            keywords=keywords,
+            row_cnt=row_cnt,
+            min_run=min_run,
+            dbda_only=dbda_only,
+            is_nested=is_nested,
+            additional_filters=table_filters_str,
+            table_to_use="dev_dbda.bq_query_history_analysis",
+        )
+
+    def see_query_example(
+        self,
+        keywords: Optional[str] = None,
+        row_cnt: int = 5,
+        min_run: int = 5,
+        dbda_only: bool = True,
+        is_nested: bool = False,
+        additional_filters: str = "",
+        table_to_use: str = "dev_dbda.bq_query_history",
+    ) -> list[str]:
         keywords_filter = (
             f'and regexp_contains(query,r"(?i){keywords}")' if keywords else ""
         )
@@ -563,11 +591,11 @@ class BigQuery:
                 SELECT DISTINCT 
                     query,
                     COUNT(*) as cnt
-                FROM dev_dbda.bq_query_history_analysis
+                FROM {table_to_use}
                 WHERE 1=1 
                 {dbda_filter}
                 {keywords_filter}
-                {table_filters_str}
+                {additional_filters}
                 AND creation_date >= date_add(current_date("+8"),interval -2 month)
                 AND regexp_contains(job_type_level2,r"(?i)scheduled_query|script_job")
                 GROUP BY All having cnt >= {min_run} 
@@ -576,15 +604,13 @@ class BigQuery:
         )
         if df.empty and not is_nested:
             return self.see_query_example(
-                destination_table_name=destination_table_name,
-                destination_dataset_name=destination_dataset_name,
-                source_table_name=source_table_name,
-                source_dataset_name=source_dataset_name,
                 keywords=keywords,
                 row_cnt=row_cnt,
                 min_run=1,
                 dbda_only=False,
                 is_nested=True,
+                additional_filters=additional_filters,
+                table_to_use=table_to_use,
             )
         if "query" not in df.columns:
             return [df.to_markdown()]
