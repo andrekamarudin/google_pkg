@@ -94,7 +94,7 @@ class BigQuery:
             self.client = self.bq_service.client
         except Exception as e:
             self.__class__._instances.pop(self.project, None)
-            raise e
+            raise SystemExit(e)
 
     # async def _process_page(self, page, qbar, results):
     def _process_page(self, page, qbar, results):
@@ -141,7 +141,7 @@ class BigQuery:
         dry_run_result = self._dry_run(sql, project)
         if not dry_run_result["success"]:
             logger.warning(pformat(dry_run_result))
-            raise dry_run_result["error_obj"]
+            raise SystemExit(dry_run_result["error_obj"])
         sql_extract = re.sub(r"[\s\n]+", " ", sql)[:150]
 
         if (query_size := dry_run_result["bytes_processed"] / 1e9) > 5:
@@ -157,7 +157,7 @@ class BigQuery:
             job_result: RowIterator = job.result(page_size=page_size)
         except Exception as e:
             self._highlight_sql_error(e, sql)
-            raise e
+            raise SystemExit(e)
             return {"success": False, "error": str(e)}
         duration = timedelta(seconds=round(time.time() - start_time))
         message = f"'{job.statement_type}' done in {duration}. "
