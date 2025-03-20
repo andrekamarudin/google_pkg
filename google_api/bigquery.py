@@ -66,7 +66,9 @@ class BigQuery:
         try:
             self.project = project or os.getenv("BIGQUERY_DEFAULT_PROJECT")
             if not self.project:
-                raise Exception("Project not specified nor found in environment variables")
+                raise Exception(
+                    "Project not specified nor found in environment variables"
+                )
             if hasattr(self, "initialized"):
                 logger.info(
                     f"{self.__class__.__name__} already initialized for {self.project}"
@@ -264,6 +266,7 @@ class BigQuery:
         table_id,
         dataset_id,
         replace=False,
+        job_config=None,
         specify_dtypes=False,
         batched=False,
         schema=None,
@@ -277,6 +280,7 @@ class BigQuery:
                 replace=replace,
                 schema=schema,
                 silent=silent,
+                job_config=job_config,
             )
 
         if batched:
@@ -470,12 +474,12 @@ class BigQuery:
         table_keyword: Optional[str] = None,
         dataset_keyword: Optional[str] = None,
     ) -> pd.DataFrame:
-        assert (
-            self.project == "fairprice-bigquery"
-        ), "Not implemented for projects other than fairprice-bigquery."
-        assert (
-            column_keyword or dataset_keyword or table_keyword
-        ), "At least one keyword must be provided."
+        assert self.project == "fairprice-bigquery", (
+            "Not implemented for projects other than fairprice-bigquery."
+        )
+        assert column_keyword or dataset_keyword or table_keyword, (
+            "At least one keyword must be provided."
+        )
         col_filter = (
             f"AND REGEXP_CONTAINS(column_name,r'(?i){column_keyword}')"
             if column_keyword
