@@ -20,6 +20,11 @@ from tqdm import tqdm
 
 from google_api.packages.gservice import GService, ServiceKey
 
+
+class GoogleAPIError(Exception):
+    pass
+
+
 # Define warnings to filter
 WARNINGS_TO_FILTER = [
     {"message": "To exit: use 'exit', 'quit', or Ctrl-D.", "category": None},
@@ -66,7 +71,7 @@ class BigQuery:
         try:
             self.project = project or os.getenv("BIGQUERY_DEFAULT_PROJECT")
             if not self.project:
-                raise Exception(
+                raise GoogleAPIError(
                     "Project not specified nor found in environment variables"
                 )
             if hasattr(self, "initialized"):
@@ -96,7 +101,7 @@ class BigQuery:
             self.client = self.bq_service.client
         except Exception as e:
             self.__class__._instances.pop(self.project, None)
-            raise SystemExit(e)
+            raise GoogleAPIError(e)
 
     # async def _process_page(self, page, qbar, results):
     def _process_page(self, page, qbar, results):
@@ -143,7 +148,7 @@ class BigQuery:
         dry_run_result = self._dry_run(sql, project)
         if not dry_run_result["success"]:
             logger.warning(pformat(dry_run_result))
-            raise SystemExit(dry_run_result["error_obj"])
+            raise GoogleAPIError(dry_run_result["error_obj"])
         sql_extract = re.sub(r"[\s\n]+", " ", sql)[:150]
 
         if (query_size := dry_run_result["bytes_processed"] / 1e9) > 5:
@@ -159,7 +164,7 @@ class BigQuery:
             job_result: RowIterator = job.result(page_size=page_size)
         except Exception as e:
             self._highlight_sql_error(e, sql)
-            raise SystemExit(e)
+            raise GoogleAPIError(e)
             return {"success": False, "error": str(e)}
         duration = timedelta(seconds=round(time.time() - start_time))
         message = f"'{job.statement_type}' done in {duration}. "
