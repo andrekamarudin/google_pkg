@@ -1,9 +1,10 @@
+# %%
 import os
 import re
 import sys
 import time
 import warnings
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from pprint import pformat
 from typing import Any, Optional, Set
@@ -11,14 +12,14 @@ from typing import Any, Optional, Set
 import numpy as np
 import pandas as pd
 from colorama import Fore, Style
+from dateutil.relativedelta import relativedelta
 from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 from google.cloud.bigquery.table import RowIterator
 from google.oauth2 import service_account
 from loguru import logger
+from packages.gservice import GService, ServiceKey
 from tqdm import tqdm
-
-from google_api.packages.gservice import GService, ServiceKey
 
 
 class GoogleAPIError(Exception):
@@ -459,6 +460,20 @@ class BigQuery:
             if not table_keyword or re.search(table_keyword, table.table_id)
         ]
 
+    def delete_table_or_view(
+        self,
+        table_id: str,
+        dataset_id: str,
+        project: Optional[str] = None,
+    ):
+        project = project or self.project
+        table_ref = self.client.dataset(dataset_id, project).table(table_id)
+        try:
+            self.client.delete_table(table_ref, not_found_ok=True)
+            logger.success(f"Table or view {table_id} deleted successfully.")
+        except NotFound:
+            logger.warning(f"Table or view {table_id} not found.")
+
     def q_database_tables(
         self,
         column_keyword: Optional[str] = None,
@@ -738,3 +753,26 @@ class BigQueryService:
         except NotFound:
             logger.error(f"Table {table_id} does not exist. Continuing in 5 seconds...")
             return table_ref
+
+    def get_running_jobs(self) -> list[bigquery.job.QueryJob]:
+        return list(
+            self.client.list_jobs(
+                # state_filter="RUNNING",
+                all_users=False,
+                min_creation_time=datetime.now() - relativedelta(days=1),
+                page_size=10,
+            )
+        )
+
+
+def main():
+    bq = BigQuery(project="fairprice-bigquery")
+    print(bq.bq_service.get_running_jobs())
+
+
+if __name__ == "__main__":
+    logger.remove()
+    LOG_FMT = "<level>{level}: {message}</level> <black>({file} / {module} / {function} / {line})</black>"
+    logger.add(sys.stdout, level="SUCCESS", format=LOG_FMT)
+    main()
+# %%
