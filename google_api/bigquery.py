@@ -19,11 +19,10 @@ from google.cloud.bigquery.table import RowIterator
 from google.oauth2 import service_account
 from loguru import logger
 from tqdm import tqdm
-import sys
-from pathlib import Path
 
 sys.path.extend([str(x) for x in Path(__file__).parents])
 from packages.gservice import GService, ServiceKey
+
 
 class GoogleAPIError(Exception):
     pass
@@ -166,6 +165,7 @@ class BigQuery:
 
         try:
             job_result: RowIterator = job.result(page_size=page_size)
+            self._last_job_result: RowIterator = job_result
         except Exception as e:
             self._highlight_sql_error(e, sql)
             raise GoogleAPIError(e)
