@@ -1,9 +1,10 @@
+# %%
 import os
 import re
 import sys
 import time
 import warnings
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from pprint import pformat
 from typing import Any, Optional, Set
@@ -11,6 +12,7 @@ from typing import Any, Optional, Set
 import numpy as np
 import pandas as pd
 from colorama import Fore, Style
+from dateutil.relativedelta import relativedelta
 from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 from google.cloud.bigquery.table import RowIterator
@@ -18,7 +20,13 @@ from google.oauth2 import service_account
 from loguru import logger
 from tqdm import tqdm
 
-from google_api.packages.gservice import GService, ServiceKey
+sys.path.extend([str(x) for x in Path(__file__).parents])
+from packages.gservice import GService, ServiceKey
+
+
+class GoogleAPIError(Exception):
+    pass
+
 
 # Define warnings to filter
 WARNINGS_TO_FILTER = [
@@ -66,7 +74,7 @@ class BigQuery:
         try:
             self.project = project or os.getenv("BIGQUERY_DEFAULT_PROJECT")
             if not self.project:
-                raise Exception(
+                raise GoogleAPIError(
                     "Project not specified nor found in environment variables"
                 )
             if hasattr(self, "initialized"):
@@ -96,7 +104,29 @@ class BigQuery:
             self.client = self.bq_service.client
         except Exception as e:
             self.__class__._instances.pop(self.project, None)
-            raise SystemExit(e)
+            raise GoogleAPIError(e)
+
+    @property
+    def dry_run_only(self) -> bool:
+        """
+        Check if the BigQuery instance is in dry run mode.
+        """
+        if not hasattr(self, "_dry_run_only"):
+            self._dry_run_only = False
+        return self._dry_run_only
+
+    @dry_run_only.setter
+    def dry_run_only(self, value: bool):
+        """
+        Set the dry run mode for the BigQuery instance.
+        """
+        if not isinstance(value, bool):
+            raise ValueError("dry_run_only must be a boolean value.")
+        self._dry_run_only = value
+        if value:
+            logger.warning(
+                "BigQuery is set to dry run mode. No actual queries will be executed."
+            )
 
     # async def _process_page(self, page, qbar, results):
     def _process_page(self, page, qbar, results):
@@ -143,7 +173,12 @@ class BigQuery:
         dry_run_result = self._dry_run(sql, project)
         if not dry_run_result["success"]:
             logger.warning(pformat(dry_run_result))
-            raise SystemExit(dry_run_result["error_obj"])
+            return {
+                "success": False,
+                "error": dry_run_result["error"],
+                "error_obj": dry_run_result["error_obj"],
+            }
+            raise GoogleAPIError(dry_run_result["error_obj"])
         sql_extract = re.sub(r"[\s\n]+", " ", sql)[:150]
 
         if (query_size := dry_run_result["bytes_processed"] / 1e9) > 5:
@@ -157,9 +192,11 @@ class BigQuery:
 
         try:
             job_result: RowIterator = job.result(page_size=page_size)
+            self._last_job: bigquery.QueryJob = job  # Store the job instead
+            self._last_job_result: RowIterator = job_result
         except Exception as e:
             self._highlight_sql_error(e, sql)
-            raise SystemExit(e)
+            raise GoogleAPIError(e)
             return {"success": False, "error": str(e)}
         duration = timedelta(seconds=round(time.time() - start_time))
         message = f"'{job.statement_type}' done in {duration}. "
@@ -217,7 +254,11 @@ class BigQuery:
         :param wait_for_results: Whether to wait for the query to complete
         :return: DataFrame containing the query results
         """
-        result = self._query(
+        if self.dry_run_only:
+            dry_run_result: dict = self._dry_run(sql, project)
+            return pd.DataFrame([dry_run_result])
+
+        result: dict[str, Any] = self._query(
             sql=sql,
             project=project,
             sample_row_cnt=sample_row_cnt,
@@ -454,6 +495,20 @@ class BigQuery:
             if not table_keyword or re.search(table_keyword, table.table_id)
         ]
 
+    def delete_table_or_view(
+        self,
+        table_id: str,
+        dataset_id: str,
+        project: Optional[str] = None,
+    ):
+        project = project or self.project
+        table_ref = self.client.dataset(dataset_id, project).table(table_id)
+        try:
+            self.client.delete_table(table_ref, not_found_ok=True)
+            logger.success(f"Table or view {table_id} deleted successfully.")
+        except NotFound:
+            logger.warning(f"Table or view {table_id} not found.")
+
     def q_database_tables(
         self,
         column_keyword: Optional[str] = None,
@@ -516,21 +571,26 @@ class BigQuery:
         table_id: str,
         dataset_id: str,
         project: Optional[str] = None,
-    ) -> pd.Timestamp:
+    ) -> datetime:
         project = project or self.project
         results = self.q(f"""
         SELECT TIMESTAMP_MILLIS(last_modified_time) AS last_modified
         FROM `{project}.{dataset_id}.__TABLES__`,
         UNNEST([table_id = "{table_id}"]) AS is_exact_match,
         UNNEST([table_id LIKE "{table_id}%"]) AS is_like_match
-        WHERE 1=1 
-            AND is_like_match
+        WHERE is_like_match
         ORDER BY is_exact_match DESC, last_modified DESC
         LIMIT 1
         """)
         if results.empty:
             logger.warning(f"No results found for table {table_id}")
-        return results["last_modified"][0]
+            return datetime(1970, 1, 1)
+        elif len(results) > 1:
+            logger.warning(
+                f"Multiple results found for table {table_id}. Returning the most recent one."
+            )
+        pd_time: pd.Timestamp = results["last_modified"][0]
+        return pd.to_datetime(pd_time)
 
     def see_scheduled_query_example(
         self,
@@ -733,3 +793,25 @@ class BigQueryService:
         except NotFound:
             logger.error(f"Table {table_id} does not exist. Continuing in 5 seconds...")
             return table_ref
+
+    def get_running_jobs(self) -> list[bigquery.job.QueryJob]:
+        return list(
+            self.client.list_jobs(
+                # state_filter="RUNNING",
+                all_users=False,
+                min_creation_time=datetime.now() - relativedelta(days=1),
+                page_size=10,
+            )
+        )
+
+
+def main():
+    bq = BigQuery(project="fairprice-bigquery")
+    print(bq.bq_service.get_running_jobs())
+
+
+if __name__ == "__main__":
+    logger.remove()
+    LOG_FMT = "<level>{level}: {message}</level> <black>({file} / {module} / {function} / {line})</black>"
+    logger.add(sys.stdout, level="SUCCESS", format=LOG_FMT)
+    main()

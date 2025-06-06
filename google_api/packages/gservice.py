@@ -50,14 +50,15 @@ class GService:
             + f"DBDA_GOOGLE_APPLICATION_CREDENTIALS: {os.getenv('DBDA_GOOGLE_APPLICATION_CREDENTIALS')=}\n"
         )
 
-        if service_key and isinstance(service_key, ServiceKey):
+        # if service_key and isinstance(service_key, ServiceKey):
+        if service_key and service_key.__class__.__name__ == "ServiceKey":
             self.service_key = service_key
         elif service_key_env_var:
             service_key_path_str: str = os.environ[service_key_env_var]
             self.service_key_path: Path = Path(service_key_path_str)
-            assert (
-                self.service_key_path.exists()
-            ), f"service_key_env_var provided not found: {service_key_path_str}"
+            assert self.service_key_path.exists(), (
+                f"service_key_env_var provided not found: {service_key_path_str}"
+            )
             self.service_key: ServiceKey = ServiceKey(
                 **json.loads(self.service_key_path.read_text())
             )
@@ -68,9 +69,9 @@ class GService:
                 else service_key_path
             )
             self.service_key_path = service_key_path
-            assert (
-                self.service_key_path.exists()
-            ), f"service_key_path provided not found: {service_key_path}"
+            assert self.service_key_path.exists(), (
+                f"service_key_path provided not found: {service_key_path}"
+            )
             service_key_path_str: str = self.service_key_path.read_text()
             self.service_key: ServiceKey = ServiceKey(
                 **json.loads(service_key_path_str)
@@ -79,7 +80,9 @@ class GService:
             "DBDA_GOOGLE_APPLICATION_CREDENTIALS"
         ):
             self.service_key_path: Path = Path(GOOGLE_APPLICATION_CREDENTIALS)
-            assert self.service_key_path.exists(), f"DBDA_GOOGLE_APPLICATION_CREDENTIALS provided not found: {GOOGLE_APPLICATION_CREDENTIALS}"
+            assert self.service_key_path.exists(), (
+                f"DBDA_GOOGLE_APPLICATION_CREDENTIALS provided not found: {GOOGLE_APPLICATION_CREDENTIALS}"
+            )
             service_key_path_str: str = self.service_key_path.read_text()
             self.service_key: ServiceKey = ServiceKey(
                 **json.loads(service_key_path_str)
