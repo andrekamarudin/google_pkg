@@ -21,6 +21,7 @@ from loguru import logger
 from tqdm import tqdm
 
 sys.path.extend([str(x) for x in Path(__file__).parents])
+from packages.charting import chart
 from packages.gservice import GService, ServiceKey
 
 
@@ -679,6 +680,27 @@ class BigQuery:
 
     def indent_query(self, query: str, indent: str = "    ") -> str:
         return "".join(indent + line for line in query.splitlines(keepends=True))
+
+    def chart(
+        self,
+        df: pd.DataFrame,
+        x_col: str = "",
+        y_col: str = "",
+        color_col: str = "",
+        agg: str = "",
+        chart_type: str = "",
+    ):
+        """
+        Start a Gradio app to visualize a DataFrame with Plotly charts.
+        """
+        return chart(
+            df=df,
+            x_col=x_col,
+            y_col=y_col,
+            color_col=color_col,
+            agg=agg,
+            chart_type=chart_type,
+        )
 
 
 class BigQueryService:
