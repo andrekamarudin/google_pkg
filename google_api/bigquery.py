@@ -103,6 +103,7 @@ class BigQuery:
                 service_key=service_key,
             )
             self.client = self.bq_service.client
+            self.chart = staticmethod(chart)
         except Exception as e:
             self.__class__._instances.pop(self.project, None)
             raise GoogleAPIError(e)
@@ -681,27 +682,6 @@ class BigQuery:
     def indent_query(self, query: str, indent: str = "    ") -> str:
         return "".join(indent + line for line in query.splitlines(keepends=True))
 
-    def chart(
-        self,
-        df: pd.DataFrame,
-        x_col: str = "",
-        y_col: str = "",
-        color_col: str = "",
-        agg: str = "",
-        chart_type: str = "",
-    ):
-        """
-        Start a Gradio app to visualize a DataFrame with Plotly charts.
-        """
-        return chart(
-            df=df,
-            x_col=x_col,
-            y_col=y_col,
-            color_col=color_col,
-            agg=agg,
-            chart_type=chart_type,
-        )
-
 
 class BigQueryService:
     _instances = {}
@@ -830,10 +810,3 @@ class BigQueryService:
 def main():
     bq = BigQuery(project="fairprice-bigquery")
     print(bq.bq_service.get_running_jobs())
-
-
-if __name__ == "__main__":
-    logger.remove()
-    LOG_FMT = "<level>{level}: {message}</level> <black>({file} / {module} / {function} / {line})</black>"
-    logger.add(sys.stdout, level="SUCCESS", format=LOG_FMT)
-    main()

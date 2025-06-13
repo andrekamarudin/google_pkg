@@ -2,6 +2,7 @@
 import gradio as gr
 import pandas as pd
 import plotly.express as px
+from loguru import logger
 from plotly.graph_objs._figure import Figure
 
 
@@ -12,6 +13,8 @@ def chart(
     color_col: str = "",
     agg: str = "",
     chart_type: str = "",
+    x_lim: tuple[float, float] | None = None,
+    y_lim: tuple[float, float] | None = None,
 ) -> None:
     chart_type_values: list[str] = [
         "line",
@@ -50,6 +53,8 @@ def chart(
         y_col: str,
         color_col: str,
         agg: str,
+        x_lim: tuple[float, float] | None = None,
+        y_lim: tuple[float, float] | None = None,
     ) -> Figure:
         """
         Update the table and plot based on the selected filters.
@@ -74,7 +79,8 @@ def chart(
                 if df_copy[col + "_numeric"].notna().all():
                     # Replace original column with numeric version for sorting
                     sort_cols[sort_cols.index(col)] = col + "_numeric"
-            except:
+            except Exception as e:
+                logger.warning(f"Could not convert column {col} to numeric: {e}")
                 pass
 
         df_copy = df_copy.sort_values(by=sort_cols, ascending=True)
@@ -93,7 +99,13 @@ def chart(
 
         # Force x-axis to follow the order in the dataframe
         unique_x_values = df_copy[x_col].unique().tolist()
-        fig.update_xaxes(categoryorder="array", categoryarray=unique_x_values)
+
+        fig.update_yaxes(range=y_lim)
+        fig.update_xaxes(
+            categoryorder="array",
+            categoryarray=unique_x_values,
+            range=x_lim,
+        )
 
         return fig
 
@@ -103,37 +115,39 @@ def chart(
         with gr.Row():
             chart_type_dropdown = gr.Dropdown(
                 choices=chart_type_values,
-                value=chart_type or chart_type_values[0],
+                value=chart_type_values[0],
                 label="Chart Type",
             )
             x_col_dropdown = gr.Dropdown(
                 choices=x_col_values,
-                value=x_col or x_col_values[0],
+                value=x_col_values[0],
                 label="X-axis",
             )
             y_col_dropdown = gr.Dropdown(
                 choices=y_col_values,
-                value=y_col or y_col_values[0],
+                value=y_col_values[0],
                 label="Y-axis",
             )
             agg_dropdown = gr.Dropdown(
                 choices=agg_values,
-                value=agg or agg_values[0],
+                value=agg_values[0],
                 label="Aggregation",
             )
             color_col_dropdown = gr.Dropdown(
                 choices=color_col_values,
-                value=color_col or color_col_values[0],
+                value=color_col_values[0],
                 label="Color by",
             )
 
         plot_output = gr.Plot(
             value=update(
-                chart_type=chart_type_values[0],
-                x_col=x_col_values[0],
-                y_col=y_col_values[1],
-                color_col=color_col_values[2],
-                agg=agg_values[0],
+                chart_type=chart_type or chart_type_values[0],
+                x_col=x_col or x_col_values[0],
+                y_col=y_col or y_col_values[0],
+                color_col=color_col or color_col_values[0],
+                agg=agg or agg_values[0],
+                x_lim=x_lim,
+                y_lim=y_lim,
             ),
             label="Plot",
         )
@@ -154,9 +168,18 @@ def chart(
         outputs: list[gr.Dataframe | gr.Plot] = [plot_output]
         for widget in inputs:
             widget.change(fn=update, inputs=inputs, outputs=outputs)
+
     demo.launch(inbrowser=True)
 
 
 if __name__ == "__main__":
     df: pd.DataFrame = px.data.gapminder()
-    chart(df=df)
+    chart(
+        df=df,
+        x_col="year",
+        y_col="pop",
+        color_col="continent",
+        chart_type="line",
+    )
+
+# %%
