@@ -71,6 +71,7 @@ class BigQuery:
         location=None,
         service_key_path: Optional[Path | str] = None,
         service_key: Optional[ServiceKey] = None,
+        dry_run_only: bool = False,
     ):
         try:
             self.project = project or os.getenv("BIGQUERY_DEFAULT_PROJECT")
@@ -104,31 +105,10 @@ class BigQuery:
             )
             self.client = self.bq_service.client
             self.chart = staticmethod(chart)
+            self.dry_run_only: bool = dry_run_only
         except Exception as e:
             self.__class__._instances.pop(self.project, None)
             raise GoogleAPIError(e)
-
-    @property
-    def dry_run_only(self) -> bool:
-        """
-        Check if the BigQuery instance is in dry run mode.
-        """
-        if not hasattr(self, "_dry_run_only"):
-            self._dry_run_only = False
-        return self._dry_run_only
-
-    @dry_run_only.setter
-    def dry_run_only(self, value: bool):
-        """
-        Set the dry run mode for the BigQuery instance.
-        """
-        if not isinstance(value, bool):
-            raise ValueError("dry_run_only must be a boolean value.")
-        self._dry_run_only = value
-        if value:
-            logger.warning(
-                "BigQuery is set to dry run mode. No actual queries will be executed."
-            )
 
     # async def _process_page(self, page, qbar, results):
     def _process_page(self, page, qbar, results):
