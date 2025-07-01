@@ -17,6 +17,7 @@ from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 from google.cloud.bigquery.table import RowIterator
 from google.oauth2 import service_account
+from icecream import ic  # noqa
 from loguru import logger
 from tqdm import tqdm
 
@@ -76,9 +77,8 @@ class BigQuery:
         try:
             self.project = project or os.getenv("BIGQUERY_DEFAULT_PROJECT")
             if not self.project:
-                raise GoogleAPIError(
-                    "Project not specified nor found in environment variables"
-                )
+                logger.error("Project not specified nor found in environment variables")
+                raise SystemExit()
             if hasattr(self, "initialized"):
                 logger.info(
                     f"{self.__class__.__name__} already initialized for {self.project}"
@@ -96,6 +96,14 @@ class BigQuery:
                 service_key_path = os.getenv("DBDA_GOOGLE_APPLICATION_CREDENTIALS")
             else:
                 service_key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            if service_key_path:
+                assert Path(service_key_path).exists(), (
+                    f"Service key path {service_key_path} does not exist."
+                )
+            else:
+                assert service_key, (
+                    "Either service_key_path or service_key must be provided."
+                )
             self.bq_service = BigQueryService(
                 self,
                 project=project,
@@ -108,7 +116,8 @@ class BigQuery:
             self.dry_run_only: bool = dry_run_only
         except Exception as e:
             self.__class__._instances.pop(self.project, None)
-            raise GoogleAPIError(e)
+            logger.error(e)
+            raise SystemExit()
 
     # async def _process_page(self, page, qbar, results):
     def _process_page(self, page, qbar, results):
@@ -147,26 +156,28 @@ class BigQuery:
         page_size: int = 50000,
         sample_row_cnt: Optional[int] = 100000,
         wait_for_results: bool = True,
+        skip_dry_run: bool = False,
         *args,
         **kwargs,
     ) -> dict[str, Any]:
         project = project or self.project
 
-        dry_run_result = self._dry_run(sql, project)
-        if not dry_run_result["success"]:
-            logger.warning(pformat(dry_run_result))
-            return {
-                "success": False,
-                "error": dry_run_result["error"],
-                "error_obj": dry_run_result["error_obj"],
-            }
-            raise GoogleAPIError(dry_run_result["error_obj"])
+        if not skip_dry_run:
+            dry_run_result = self._dry_run(sql, project)
+            if not dry_run_result["success"]:
+                logger.warning(pformat(dry_run_result))
+                return {
+                    "success": False,
+                    "error": dry_run_result["error"],
+                    "error_obj": dry_run_result["error_obj"],
+                }
+            if (query_size := dry_run_result["bytes_processed"] / 1e9) > 5:
+                logger.warning(f"Query bytes: {query_size:,.2f} GB")
+
         sql_extract = re.sub(r"[\s\n]+", " ", sql)[:150]
-
-        if (query_size := dry_run_result["bytes_processed"] / 1e9) > 5:
-            logger.warning(f"Query bytes: {query_size:,.2f} GB")
-
         logger.success(sql_extract)
+        self._last_sql = sql  # Store the last SQL query for reference
+
         start_time: float = time.time()
         job: bigquery.QueryJob = self.client.query(sql)
         if not wait_for_results:
@@ -178,11 +189,10 @@ class BigQuery:
             self._last_job_result: RowIterator = job_result
         except Exception as e:
             self._highlight_sql_error(e, sql)
-            raise GoogleAPIError(e)
-            return {"success": False, "error": str(e)}
+            logger.error(e)
+            raise SystemExit()
         duration = timedelta(seconds=round(time.time() - start_time))
         message = f"'{job.statement_type}' done in {duration}. "
-
         # if job_result.total_rows == 0:
         #     # no rows returned
         #     return {"success": True, "message": f"{message}\nNo rows returned."}
@@ -210,14 +220,13 @@ class BigQuery:
             logger.success(message)
 
         job_sample: RowIterator = job.result(max_results=sample_row_cnt)
-        sample_result: list[dict] = [dict(row) for row in job_sample]
 
         return {
             "success": True,
             "message": message,
             "job_result": job_result,
             "total_rows": job_result.total_rows,
-            "sample_result": sample_result,
+            "job_sample": job_sample,
             "duration": duration,
         }
 
@@ -261,7 +270,12 @@ class BigQuery:
             logger.error(
                 f"Query returned {total_rows} rows, which is over the limit set. Retrieving only the first {sample_row_cnt} rows. Set sample_row_cnt=0 to retrieve all rows."
             )
-            final_result = pd.DataFrame(result.get("sample_result"))
+            job_sample = result.get("job_sample")
+            sample_result: list[dict] = [
+                dict(row)
+                for row in tqdm(job_sample, desc=f"Loading {sample_row_cnt:,.0f} rows")
+            ]
+            final_result = pd.DataFrame(sample_result)
 
         if final_result is None:
             return pd.DataFrame(result, index=[0])
@@ -430,22 +444,13 @@ class BigQuery:
         table_id: str,
         dataset_id: str,
         project: Optional[str] = None,
-    ) -> set[str]:
-        result = self._query(
-            rf"""
-            SELECT *
-            FROM `{project}`.{dataset_id}.INFORMATION_SCHEMA.COLUMNS
-            WHERE table_name = '{table_id}';
-            """
+    ) -> pd.DataFrame:
+        return self.search_columns(
+            column_keyword=".",
+            table_keyword=f"^{table_id}$",
+            dataset_keyword=f"^{dataset_id}$",
+            project=project,
         )
-        if not result["success"]:
-            return set()
-        df = self._load_to_dataframe(result["job_result"])
-        tables: Set[str] = {
-            f"{row['column_name']}: ({row['data_type']}){' is_partitioning_column' if row['is_partitioning_column'] == 'YES' else ''}"
-            for _, row in df.iterrows()
-        }
-        return tables
 
     def search_datasets(
         self,
@@ -459,6 +464,43 @@ class BigQuery:
             for dataset in datasets
             if not dataset_keyword or re.search(dataset_keyword, dataset.dataset_id)
         ]
+
+    def search_columns(
+        self,
+        column_keyword: str = ".",
+        table_keyword: str = ".",
+        dataset_keyword: str = ".",
+        project: Optional[str] = None,
+    ) -> pd.DataFrame:
+        project = project or self.project
+
+        def get_sql(project, dataset, table_keyword, column_keyword) -> str:
+            return rf"""
+            SELECT 
+                table_schema,
+                table_name, 
+                ordinal_position,
+                column_name, 
+                data_type, 
+                is_partitioning_column, 
+            FROM `{project}.{dataset}.INFORMATION_SCHEMA.COLUMNS`
+            where 1=1
+            and regexp_contains(table_name,r"(?i){table_keyword}")
+            and regexp_contains(column_name,r"(?i){column_keyword}")
+            """
+
+        sqls: str = " union all ".join(
+            get_sql(project, dataset, table_keyword, column_keyword)
+            for dataset in self.search_datasets(
+                dataset_keyword=dataset_keyword, project=project
+            )
+        )
+        df = self.q(sqls + " ORDER BY 1,2,3", project=project, sample_row_cnt=0)
+        if df.empty:
+            logger.warning(
+                f"No columns found for keyword '{column_keyword}' in tables matching '{table_keyword}' in datasets matching '{dataset_keyword}'"
+            )
+        return df
 
     def search_tables(
         self,
@@ -766,17 +808,17 @@ class BigQueryService:
         project: Optional[str] = None,
     ) -> bigquery.Table | bigquery.TableReference:
         project = project or self.project
-        dataset = self.ensure_dataset(dataset_id, project)
-        table_ref = dataset.table(table_id)
+        dataset: bigquery.Dataset = self.ensure_dataset(dataset_id, project)
+        table_ref: bigquery.TableReference = dataset.table(table_id)
         try:
-            table = self.client.get_table(table_ref)
+            table: bigquery.Table = self.client.get_table(table_ref)
             logger.info(f"Table {table_id} exists")
             return table
         except NotFound:
             logger.error(f"Table {table_id} does not exist. Continuing in 5 seconds...")
             return table_ref
 
-    def get_running_jobs(self) -> list[bigquery.job.QueryJob]:
+    def get_running_jobs(self) -> list[bigquery.QueryJob]:
         return list(
             self.client.list_jobs(
                 # state_filter="RUNNING",
@@ -788,5 +830,9 @@ class BigQueryService:
 
 
 def main():
-    bq = BigQuery(project="fairprice-bigquery")
-    print(bq.bq_service.get_running_jobs())
+    bq = BigQuery(project="andrekamarudin")
+    bq.search_columns("chance", dataset_keyword="sch")
+
+
+if __name__ == "__main__":
+    main()
