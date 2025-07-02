@@ -5,8 +5,10 @@ import sys
 import time
 import warnings
 from datetime import datetime, timedelta
+from functools import partial
 from pathlib import Path
 from pprint import pformat
+from textwrap import indent as _indent
 from typing import Any, Optional, Set
 
 import numpy as np
@@ -24,6 +26,8 @@ from tqdm import tqdm
 sys.path.extend([str(x) for x in Path(__file__).parents])
 from packages.charting import chart
 from packages.gservice import GService, ServiceKey
+
+indent = partial(_indent, prefix="    ")
 
 
 class GoogleAPIError(Exception):
@@ -75,7 +79,7 @@ class BigQuery:
         dry_run_only: bool = False,
     ):
         try:
-            self.project = project or os.getenv("BIGQUERY_DEFAULT_PROJECT")
+            self.project: str = project or os.environ["BIGQUERY_DEFAULT_PROJECT"]
             if not self.project:
                 logger.error("Project not specified nor found in environment variables")
                 raise SystemExit()
@@ -119,25 +123,22 @@ class BigQuery:
             logger.error(e)
             raise SystemExit()
 
-    # async def _process_page(self, page, qbar, results):
-    def _process_page(self, page, qbar, results):
-        for row in page:
-            results.append(dict(row))
-            qbar.update(1)
-
-    # async def _load_to_dataframe(self, job_result, qbar):
     def _load_to_dataframe(self, job_result: RowIterator):
         if job_result.total_rows and job_result.total_rows <= 100000:
             return job_result.to_dataframe()
         qbar = tqdm(
-            total=job_result.total_rows, unit="rows", desc="Loading to dataframe"
+            total=(
+                job_result.total_rows // job_result._page_size
+                if job_result.total_rows
+                else 0
+            ),
+            unit="rows",
+            desc="Loading to dataframe",
         )
         results = []
         for page in job_result.pages:
-            self._process_page(page, qbar, results)
-        # tasks = [self._process_page(page, qbar, results) for page in job_result.pages]
-        # await asyncio.gather(*tasks)
-        qbar.close()
+            results += [dict(row) for row in page]
+            qbar.update(1)
         return pd.DataFrame(results)
 
     def wait_for_job(
@@ -670,7 +671,7 @@ class BigQuery:
             if dbda_only
             else ""
         )
-        df = self.q(
+        df: pd.DataFrame = self.q(
             rf"""
                 SELECT DISTINCT 
                     query,
@@ -701,8 +702,21 @@ class BigQuery:
 
         return df["query"].tolist()
 
-    def indent_query(self, query: str, indent: str = "    ") -> str:
-        return "".join(indent + line for line in query.splitlines(keepends=True))
+    indent_query: partial[str] = indent
+
+    def show_schema(
+        self,
+        full_table_id: str = "",
+        table_id: str = "",
+        dataset_id: str = "",
+        project: str = "",
+    ) -> pd.DataFrame:
+        project = project or self.project
+        assert full_table_id or all([table_id, dataset_id]), (
+            "Either full_table_id or all of table_id, dataset_id, and project must be provided."
+        )
+        full_table_id = full_table_id or f"{project}.{dataset_id}.{table_id}"
+        return self.q(rf" SELECT * FROM `{full_table_id}` LIMIT 1 ").T
 
 
 class BigQueryService:
