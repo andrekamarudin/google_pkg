@@ -127,12 +127,8 @@ class BigQuery:
         if job_result.total_rows and job_result.total_rows <= 100000:
             return job_result.to_dataframe()
         qbar = tqdm(
-            total=(
-                job_result.total_rows // job_result._page_size
-                if job_result.total_rows
-                else 0
-            ),
-            unit="rows",
+            total=(job_result.total_rows // 10_000 + 1 if job_result.total_rows else 0),
+            unit="page",
             desc="Loading to dataframe",
         )
         results = []
@@ -484,7 +480,9 @@ class BigQuery:
                 column_name, 
                 data_type, 
                 is_partitioning_column, 
+                TIMESTAMP_MILLIS(last_modified_time) AS table_last_modified,
             FROM `{project}.{dataset}.INFORMATION_SCHEMA.COLUMNS`
+            LEFT JOIN `{project}.{dataset}.__TABLES__` on table_name = table_id
             where 1=1
             and regexp_contains(table_name,r"(?i){table_keyword}")
             and regexp_contains(column_name,r"(?i){column_keyword}")
@@ -496,7 +494,11 @@ class BigQuery:
                 dataset_keyword=dataset_keyword, project=project
             )
         )
-        df = self.q(sqls + " ORDER BY 1,2,3", project=project, sample_row_cnt=0)
+        df = self.q(
+            sqls + " ORDER BY table_last_modified desc, 1,2,3",
+            project=project,
+            sample_row_cnt=0,
+        )
         if df.empty:
             logger.warning(
                 f"No columns found for keyword '{column_keyword}' in tables matching '{table_keyword}' in datasets matching '{dataset_keyword}'"
@@ -709,14 +711,26 @@ class BigQuery:
         full_table_id: str = "",
         table_id: str = "",
         dataset_id: str = "",
+        sql="",
         project: str = "",
     ) -> pd.DataFrame:
         project = project or self.project
-        assert full_table_id or all([table_id, dataset_id]), (
-            "Either full_table_id or all of table_id, dataset_id, and project must be provided."
-        )
-        full_table_id = full_table_id or f"{project}.{dataset_id}.{table_id}"
-        return self.q(rf" SELECT * FROM `{full_table_id}` LIMIT 1 ").T
+        if not (full_table_id or all([table_id, dataset_id]) or sql):
+            raise ValueError(
+                "Either full_table_id or dataset_id.table_id, or sql must be provided."
+            )
+        elif sum(1 for x in [full_table_id, table_id, sql] if x) > 1:
+            raise ValueError(
+                "Only one of full_table_id, dataset_id.table_id, or sql should be provided."
+            )
+        elif sql:
+            self._dry_run(sql)
+            inner_q = f"({sql})"
+        else:
+            inner_q = full_table_id or f"{project}.{dataset_id}.{table_id}"
+            inner_q = re.sub(r"[^\w.]", "", inner_q)
+            inner_q = f"`{inner_q}`"
+        return self.q(rf" SELECT * FROM {inner_q} LIMIT 1 ").T
 
 
 class BigQueryService:
