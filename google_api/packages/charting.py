@@ -1,9 +1,15 @@
 # %%
-import gradio as gr
+
+import sys
+from typing import TYPE_CHECKING
+
 import pandas as pd
 import plotly.express as px
 from loguru import logger
 from plotly.graph_objs._figure import Figure
+
+if TYPE_CHECKING:
+    import gradio as gr
 
 
 def chart(
@@ -28,14 +34,23 @@ def chart(
         "funnel",
         "sunburst",
     ]
-    metrics: list[str] = sorted(df.columns.tolist())
-    x_col_values: list[str] = sorted([col for col in metrics if col])
-    y_col_values: list[str] = sorted(
-        [col for col in metrics]  # if col and df[col].dtype.kind in "if"
+    all_cols: list[str] = sorted(df.columns.tolist())
+    ifs = [col for col in all_cols if col and df[col].dtype.kind in "if"]
+    nonifs = [col for col in all_cols if col and df[col].dtype.kind not in "if"]
+    y_col_values: list[str] = sorted(ifs)
+    x_col_values: list[str] = sorted(all_cols)
+    color_col_values: list[str] = sorted(nonifs)
+
+    chart_type = chart_type or chart_type_values[0]
+    y_col = y_col or y_col_values[0]
+    x_col = x_col or next(
+        (col for col in x_col_values if col != y_col), x_col_values[0]
     )
-    color_col_values: list[str] = sorted(
-        [col for col in metrics]  # if col and df[col].dtype.kind not in "if"
+    color_col = color_col or next(
+        (col for col in color_col_values if col != x_col and col != y_col),
+        color_col_values[0],
     )
+
     agg_values: list[str] = [
         "sum",
         "mean",
@@ -55,7 +70,7 @@ def chart(
         agg: str,
         x_lim: tuple[float, float] | None = None,
         y_lim: tuple[float, float] | None = None,
-    ) -> Figure:
+    ) -> "Figure":
         """
         Update the table and plot based on the selected filters.
         """
@@ -95,7 +110,7 @@ def chart(
             "color": color_col if color_col != "None" else None,
             "title": f"{y_col} by {x_col} and {color_col}",
         }
-        fig: Figure = getattr(px, chart_type)(**kwargs)
+        fig: "Figure" = getattr(px, chart_type)(**kwargs)
 
         # Force x-axis to follow the order in the dataframe
         unique_x_values = df_copy[x_col].unique().tolist()
@@ -109,33 +124,35 @@ def chart(
 
         return fig
 
+    import gradio as gr
+
     with gr.Blocks() as demo:
         gr.Markdown(value="# Disposable Dashboard with Plotly and Gradio")
 
         with gr.Row():
             chart_type_dropdown = gr.Dropdown(
                 choices=chart_type_values,
-                value=chart_type_values[0],
+                value=chart_type or chart_type_values[0],
                 label="Chart Type",
             )
             x_col_dropdown = gr.Dropdown(
                 choices=x_col_values,
-                value=x_col_values[0],
+                value=x_col or x_col_values[0],
                 label="X-axis",
             )
             y_col_dropdown = gr.Dropdown(
                 choices=y_col_values,
-                value=y_col_values[0],
+                value=y_col or y_col_values[0],
                 label="Y-axis",
             )
             agg_dropdown = gr.Dropdown(
                 choices=agg_values,
-                value=agg_values[0],
+                value=agg or agg_values[0],
                 label="Aggregation",
             )
             color_col_dropdown = gr.Dropdown(
                 choices=color_col_values,
-                value=color_col_values[0],
+                value=color_col or color_col_values[0],
                 label="Color by",
             )
 
@@ -174,12 +191,6 @@ def chart(
 
 if __name__ == "__main__":
     df: pd.DataFrame = px.data.gapminder()
-    chart(
-        df=df,
-        x_col="year",
-        y_col="pop",
-        color_col="continent",
-        chart_type="line",
-    )
+    chart(df=df)
 
 # %%

@@ -1,7 +1,8 @@
+# %%
 import asyncio
 import base64
 import os
-import sys
+import pickle
 from email import policy
 from email.message import Message
 from email.mime.multipart import MIMEMultipart
@@ -14,15 +15,13 @@ from pprint import pformat, pprint
 from typing import Any, Callable, Dict, List, Optional
 
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
-from google.oauth2 import service_account
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
 from loguru import logger
+from packages.gservice import GService
+from packages.helper import condense_text
 from pydantic import BaseModel
-
-from google_api.packages.gservice import GService, ServiceKey
-from google_api.packages.helper import condense_text
-
-load_dotenv()
+from tqdm import tqdm
 
 
 class Criteria(Enum):
@@ -64,23 +63,64 @@ class Label(Enum):
 
 
 class GmailService:
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(
+        self,
+        credentials_path: Optional[Path] = None,
+        token_path: Optional[Path] = None,
+        *args,
+        **kwargs,
+    ) -> None:
         self.SCOPES: List[str] = [
             f"https://www.googleapis.com/auth/gmail.{action}"
             for action in ["readonly", "modify", "send"]
         ]
-        self.gservice = GService(*args, **kwargs)
-        self.credentials = service_account.Credentials.from_service_account_info(
-            info=self.gservice.sa_info, scopes=self.SCOPES
-        )
+
+        # Set default paths
+        self.credentials_path = credentials_path or Path("credentials.json")
+        self.token_path = token_path or Path("token.pickle")
+
+        self.credentials = self._get_oauth_credentials()
         self.cred_file_folder: Path = Path(os.environ["USERPROFILE"])
         self.user_id: str = "me"
+
+        self.gservice = GService(service_key_path=self.credentials_path)
         self.gservice.build_service(
             scopes=self.SCOPES,
             short_name="gmail",
             version="v1",
             credentials=self.credentials,
         )
+
+    def _get_oauth_credentials(self):
+        """Get OAuth2 credentials using the installed app flow"""
+        creds = None
+
+        # Check if token.pickle exists (saved credentials)
+        if self.token_path.exists():
+            with open(self.token_path, "rb") as token:
+                creds = pickle.load(token)
+
+        # If there are no (valid) credentials available, let the user log in
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                if not self.credentials_path.exists():
+                    raise FileNotFoundError(
+                        f"OAuth credentials file not found at {self.credentials_path}. "
+                        "Download it from Google Cloud Console."
+                    )
+
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    str(self.credentials_path), self.SCOPES
+                )
+                creds = flow.run_local_server(port=0)
+
+            # Save the credentials for the next run
+            with open(self.token_path, "wb") as token:
+                pickle.dump(creds, token)
+
+        return creds
 
     def _get_msg_payload(self, msg_id: str) -> Optional[str]:
         try:
@@ -100,9 +140,9 @@ class GmailService:
         return message_payload
 
     def _message_to_content(self, email_message: Message) -> str | None:
-        assert isinstance(
-            email_message, Message
-        ), f"email_message ({type(email_message)}): {str(email_message)}"
+        assert isinstance(email_message, Message), (
+            f"email_message ({type(email_message)}): {str(email_message)}"
+        )
         content_type: str = email_message.get_content_type()
         if content_type == "text/plain":
             return email_message.get_content()
@@ -273,12 +313,25 @@ class GmailUI(GmailService):
     ) -> None:
         assert decision in self.email_decisions, f"Invalid decision: {decision}"
         function_to_call: Callable = self.email_decisions[decision]
+        qbar = tqdm(
+            total=len(msgs),
+            desc=f"{decision} {len(msgs)} emails",
+            unit="email",
+            disable=len(msgs) < 10,  # Disable progress bar for small batches
+        )
+
+        async def act(
+            msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
+        ) -> None:
+            try:
+                function_to_call(msg_id, thread_id, headers)
+            except Exception as e:
+                logger.error(f"Error processing {msg_id}: {e}")
+            qbar.update(1)
 
         await asyncio.gather(
             *[
-                function_to_call(
-                    msg_id=msg["id"], thread_id=msg["threadId"], headers=headers
-                )
+                act(msg_id=msg["id"], thread_id=msg["threadId"], headers=headers)
                 for msg in msgs
             ]
         )
@@ -341,14 +394,16 @@ class GmailUI(GmailService):
 
     async def main_loop(self, query: Optional[str] = None) -> None:
         while True:
-            search_query = query or input("Enter search query: ") or "is:unread"
-            search_results = self.search(search_query)
+            search_query: str = query or input("Enter search query: ") or "is:unread"
+            search_results: List[Dict[str, Any]] = self.search(search_query)
             for email in search_results:
-                headers = self.msg_id_to_headers(email["id"])
+                headers: EmailHeaders = self.msg_id_to_headers(email["id"])
                 pprint(headers)
-                decision = ""
+                decision: str = ""
                 while decision not in self.all_decisions and decision != "q":
-                    decision = input(self._show_options(self.all_decisions)).lower()
+                    decision: str = input(
+                        self._show_options(self.all_decisions)
+                    ).lower()
                 if decision == "q":
                     break
                 await self.all_decisions[decision](
@@ -369,7 +424,7 @@ class GmailUI(GmailService):
 
         message.attach(MIMEText(body, "plain"))
 
-        raw_message = base64.urlsafe_b64encode(
+        raw_message: str = base64.urlsafe_b64encode(
             message.as_bytes()
         ).decode()  # Encode to base64
         self.gservice.service.users().messages().send(
@@ -377,20 +432,26 @@ class GmailUI(GmailService):
             body={"raw": raw_message},  # Use the encoded message as the body
         ).execute()
 
-
-def main():
-    gmail = GmailUI(service_key_path=os.environ["SMERK_GOOGLE_APPLICATION_CREDENTIALS"])
-
-    # Test with listing Gmail labels to ensure the API and credentials are functioning
-    try:
-        response = gmail.gservice.service.users().labels().list(userId="me").execute()
-        print("Labels List:", response)
-    except Exception as e:
-        print("Error while fetching labels:", e)
+    @property
+    def labels(self) -> List[Dict[str, Any]]:
+        response: dict = (
+            self.gservice.service.users().labels().list(userId="me").execute()
+        )
+        return response.get("labels", [])
 
 
+# %%
 if __name__ == "__main__":
-    logger.remove()
-    LOG_FMT = "<level>{level}: {message}</level> <black>({file} / {module} / {function} / {line})</black>"
-    logger.add(sys.stdout, level="SUCCESS", format=LOG_FMT)
-    main()
+    gmail = GmailUI(
+        credentials_path=Path(
+            r"c:\Users\andre\OneDrive\Apps\OAUTH_GOOGLE_APPLICATION_CREDENTIALS.json"
+        ),
+        token_path=Path(r"c:\Users\andre\OneDrive\Apps\gmail_token.pickle"),
+        service_key_path=Path(
+            r"c:\Users\andre\OneDrive\Apps\ANDRE_GOOGLE_APPLICATION_CREDENTIALS.json"
+        ),
+    )
+    asyncio.run(gmail.main_loop())
+
+
+# %%

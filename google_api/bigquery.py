@@ -3,7 +3,6 @@ import os
 import re
 import sys
 import time
-import warnings
 from datetime import datetime, timedelta
 from functools import partial
 from pathlib import Path
@@ -25,34 +24,9 @@ from tqdm import tqdm
 
 sys.path.extend([str(x) for x in Path(__file__).parents])
 from packages.charting import chart
-from packages.gservice import GService, ServiceKey
+from packages.gservice import GService
 
 indent = partial(_indent, prefix="    ")
-
-
-class GoogleAPIError(Exception):
-    pass
-
-
-# Define warnings to filter
-WARNINGS_TO_FILTER = [
-    {"message": "To exit: use 'exit', 'quit', or Ctrl-D.", "category": None},
-    {
-        "message": "BigQuery Storage module not found, fetch data with the REST endpoint instead.",
-        "category": UserWarning,
-        "module": "google.cloud.bigquery.table",
-    },
-]
-for warning in WARNINGS_TO_FILTER:
-    kwargs = {k: v for k, v in warning.items() if v is not None}
-    # Use regex pattern matching for messages
-    if "message" in kwargs:
-        kwargs["message"] = f"^{kwargs['message']}$"
-    warnings.filterwarnings("ignore", **kwargs)
-
-logger.remove()
-LOG_FMT = "<level>{level}: {message}</level> <black>({file} / {module} / {function} / {line})</black>"
-logger.add(sys.stdout, level="SUCCESS", format=LOG_FMT)
 
 
 class BigQuery:
@@ -75,7 +49,7 @@ class BigQuery:
         project=None,
         location=None,
         service_key_path: Optional[Path | str] = None,
-        service_key: Optional[ServiceKey] = None,
+        service_key: Optional[dict] = None,
         dry_run_only: bool = False,
     ):
         try:
@@ -118,6 +92,7 @@ class BigQuery:
             self.client = self.bq_service.client
             self.chart = staticmethod(chart)
             self.dry_run_only: bool = dry_run_only
+            logger.success(f"BigQuery {self.project} connected")
         except Exception as e:
             self.__class__._instances.pop(self.project, None)
             logger.error(e)
@@ -254,11 +229,11 @@ class BigQuery:
         )
 
         if not wait_for_results:
-            return pd.DataFrame()
+            return pd.DataFrame([result])
         elif "job_result" not in result:
             return pd.DataFrame(result, index=[0])
 
-        total_rows = result.get("total_rows", 0)
+        total_rows = result["total_rows"]
         if sample_row_cnt == 0 or (total_rows <= sample_row_cnt):
             # unlimited rows or within limit
             final_result = self._load_to_dataframe(result["job_result"])
@@ -267,7 +242,7 @@ class BigQuery:
             logger.error(
                 f"Query returned {total_rows} rows, which is over the limit set. Retrieving only the first {sample_row_cnt} rows. Set sample_row_cnt=0 to retrieve all rows."
             )
-            job_sample = result.get("job_sample")
+            job_sample: RowIterator = result["job_sample"]
             sample_result: list[dict] = [
                 dict(row)
                 for row in tqdm(job_sample, desc=f"Loading {sample_row_cnt:,.0f} rows")
@@ -299,14 +274,14 @@ class BigQuery:
         df,
         table_id,
         dataset_id,
-        replace=False,
-        job_config=None,
-        specify_dtypes=False,
-        batched=False,
-        schema=None,
+        replace: bool = False,
+        job_config: Optional[bigquery.LoadJobConfig] = None,
+        specify_dtypes: bool = False,
+        batched: bool = False,
+        schema: list[bigquery.SchemaField] | None = None,
         silent: bool = False,
     ) -> None:
-        def upload(df_slice, silent):
+        def upload(df_slice):
             self.bq_service.upload_df_to_bq(
                 df_slice,
                 table_id=table_id,
@@ -318,18 +293,18 @@ class BigQuery:
             )
 
         if batched:
-            rows = len(df)
-            batches = 20 if rows >= 20000 else 2
-            batch_size = rows // batches
-            for i in tqdm(range(batches)):
+            rows: int = len(df)
+            batches: int = 20 if rows >= 20000 else 2
+            batch_size: int = rows // batches
+            for i in tqdm(range(batches), desc="Uploading in batches", unit="batch"):
                 schema = self.get_schema(df, specify_dtypes) if i == 0 else None
-                start = i * batch_size
-                end = start + batch_size
+                start: int = i * batch_size
+                end: int = start + batch_size
                 replace = replace if i == 0 else False
-                upload(df[start:end], silent)
+                upload(df[start:end])
         else:
             schema = schema or self.get_schema(df, specify_dtypes)
-            upload(df, silent)
+            upload(df)
 
     def get_schema(
         self, df: pd.DataFrame, specify_dtypes: bool
@@ -436,19 +411,6 @@ class BigQuery:
         )
         return
 
-    def get_table_schema(
-        self,
-        table_id: str,
-        dataset_id: str,
-        project: Optional[str] = None,
-    ) -> pd.DataFrame:
-        return self.search_columns(
-            column_keyword=".",
-            table_keyword=f"^{table_id}$",
-            dataset_keyword=f"^{dataset_id}$",
-            project=project,
-        )
-
     def search_datasets(
         self,
         dataset_keyword: Optional[str] = None,
@@ -470,9 +432,7 @@ class BigQuery:
         project: Optional[str] = None,
     ) -> pd.DataFrame:
         project = project or self.project
-
-        def get_sql(project, dataset, table_keyword, column_keyword) -> str:
-            return rf"""
+        sql = """
             SELECT 
                 table_schema,
                 table_name, 
@@ -481,15 +441,19 @@ class BigQuery:
                 data_type, 
                 is_partitioning_column, 
                 TIMESTAMP_MILLIS(last_modified_time) AS table_last_modified,
-            FROM `{project}.{dataset}.INFORMATION_SCHEMA.COLUMNS`
-            LEFT JOIN `{project}.{dataset}.__TABLES__` on table_name = table_id
+            FROM `{this_project}.{this_dataset}.INFORMATION_SCHEMA.COLUMNS`
+            LEFT JOIN `{this_project}.{this_dataset}.__TABLES__` on table_name = table_id
             where 1=1
-            and regexp_contains(table_name,r"(?i){table_keyword}")
-            and regexp_contains(column_name,r"(?i){column_keyword}")
-            """
-
+            and regexp_contains(table_name,r"(?i){this_table_keyword}")
+            and regexp_contains(column_name,r"(?i){this_column_keyword}")
+        """
         sqls: str = " union all ".join(
-            get_sql(project, dataset, table_keyword, column_keyword)
+            sql.format(
+                this_project=project,
+                this_dataset=dataset,
+                this_table_keyword=table_keyword,
+                this_column_keyword=column_keyword,
+            )
             for dataset in self.search_datasets(
                 dataset_keyword=dataset_keyword, project=project
             )
@@ -512,7 +476,7 @@ class BigQuery:
         project: Optional[str] = None,
     ) -> list[str]:
         project = project or self.project
-        dataset_id_list = self.search_datasets(dataset_keyword, project)
+        dataset_id_list: list[str] = self.search_datasets(dataset_keyword, project)
         return [
             f"`{project}`.{next_dataset_id}.{table.table_id}"
             for next_dataset_id in dataset_id_list
@@ -522,7 +486,7 @@ class BigQuery:
             if not table_keyword or re.search(table_keyword, table.table_id)
         ]
 
-    def delete_table_or_view(
+    def drop_table_or_view(
         self,
         table_id: str,
         dataset_id: str,
@@ -715,22 +679,32 @@ class BigQuery:
         project: str = "",
     ) -> pd.DataFrame:
         project = project or self.project
-        if not (full_table_id or all([table_id, dataset_id]) or sql):
+        if sql:
+            self._dry_run(sql)
+            inner_q = f"({sql})"
+            return self.q(rf" SELECT * FROM {inner_q} LIMIT 1 ").T
+
+        if full_table_id:
+            parts = full_table_id.split(".")
+            if len(parts) == 3:
+                project, dataset_id, table_id = parts
+            elif len(parts) == 2:
+                dataset_id, table_id = parts
+            else:
+                raise ValueError(
+                    "full_table_id must be in the format 'project.dataset.table' or 'dataset.table'."
+                )
+        elif not (table_id and dataset_id):
             raise ValueError(
                 "Either full_table_id or dataset_id.table_id, or sql must be provided."
             )
-        elif sum(1 for x in [full_table_id, table_id, sql] if x) > 1:
-            raise ValueError(
-                "Only one of full_table_id, dataset_id.table_id, or sql should be provided."
-            )
-        elif sql:
-            self._dry_run(sql)
-            inner_q = f"({sql})"
-        else:
-            inner_q = full_table_id or f"{project}.{dataset_id}.{table_id}"
-            inner_q = re.sub(r"[^\w.]", "", inner_q)
-            inner_q = f"`{inner_q}`"
-        return self.q(rf" SELECT * FROM {inner_q} LIMIT 1 ").T
+
+        return self.search_columns(
+            column_keyword=".",
+            table_keyword=f"^{table_id}$",
+            dataset_keyword=f"^{dataset_id}$",
+            project=project,
+        )
 
 
 class BigQueryService:
@@ -756,7 +730,7 @@ class BigQueryService:
         project: Optional[str] = None,
         location: Optional[str] = None,
         service_key_path: Optional[Path | str] = None,
-        service_key: Optional[ServiceKey] = None,
+        service_key: Optional[dict] = None,
     ):
         self.project = project or os.getenv("BIGQUERY_DEFAULT_PROJECT")
         if hasattr(self, "initialized"):
@@ -774,13 +748,10 @@ class BigQueryService:
         logger.info(
             f"initializing {self.__class__.__name__} with project {self.project}"
         )
-        start_ts = time.time()
         self.credentials = service_account.Credentials.from_service_account_info(
-            info=self.gservice.sa_info, scopes=self.SCOPES
+            info=self.gservice.service_key, scopes=self.SCOPES
         )
         self.client = bigquery.Client(project=project, credentials=self.credentials)
-        duration = time.time() - start_ts
-        logger.success(f"BigQuery {self.project} connected in {duration:,.2f} seconds")
 
     def upload_df_to_bq(
         self,
@@ -856,11 +827,33 @@ class BigQueryService:
             )
         )
 
-
-def main():
-    bq = BigQuery(project="andrekamarudin")
-    bq.search_columns("chance", dataset_keyword="sch")
+    def chart(
+        self,
+        df: pd.DataFrame,
+        x_col: str = "",
+        y_col: str = "",
+        color_col: str = "",
+        agg: str = "",
+        chart_type: str = "",
+    ):
+        """
+        Start a Gradio app to visualize a DataFrame with Plotly charts.
+        """
+        return chart(
+            df=df,
+            x_col=x_col,
+            y_col=y_col,
+            color_col=color_col,
+            agg=agg,
+            chart_type=chart_type,
+        )
 
 
 if __name__ == "__main__":
-    main()
+    bq = BigQuery(project="fairprice-bigquery")
+    bq.q(
+        "SELECT * FROM `fairprice-bigquery.dev_dbda.bq_query_history` limit 1",
+        wait_for_results=False,
+    )
+
+# %%

@@ -21,6 +21,8 @@ dependencies = [
     "python-dotenv>=1.0.1,<2",
     "gradio>=5.33.1,<6",
     "plotly>=6.1.2,<7",
+    "beautifulsoup4>=4.13.4",
+    "google-auth-oauthlib>=1.2.2",
 ]
 
 [dependency-groups]

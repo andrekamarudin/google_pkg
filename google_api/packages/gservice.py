@@ -1,110 +1,58 @@
 import json
 import os
 import sys
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from loguru import logger
-from pydantic import BaseModel
 
 
-class ServiceKey(BaseModel):
-    type: str
-    project_id: str
-    private_key_id: str
-    private_key: str
-    client_email: str
-    client_id: str
-    auth_uri: str
-    token_uri: str
-    auth_provider_x509_cert_url: str
-    client_x509_cert_url: str
-    universe_domain: str
-
-
+@dataclass
 class GService:
-    """
-    A class representing a Google Service.
-    """
+    service_key: Optional[dict] = field(default=None)
+    service_key_path: Optional[Path | str] = field(default=None)
+    service_key_env_var: Optional[str] = field(default=None)
 
-    def __init__(
-        self,
-        service_key: Optional[ServiceKey | dict] = None,
-        service_key_path: Optional[Path | str] = None,
-        service_key_env_var: Optional[str] = None,
-    ):
-        logger.info("Initializing GService")
+    def __post_init__(self):
+        assert any(
+            [self.service_key, self.service_key_path, self.service_key_env_var]
+        ), "service_key, service_key_path, or service_key_env_var must be provided."
 
-        assert (
-            service_key
-            or service_key_path
-            or service_key_env_var
-            or os.getenv("DBDA_GOOGLE_APPLICATION_CREDENTIALS")
-        ), (
-            "service_key, service_key_path, or service_key_env_var must be provided\n"
-            + f"service_key: {service_key=}\n"
-            + f"service_key_path: {service_key_path=}\n"
-            + f"service_key_env_var: {service_key_env_var=}\n"
-            + f"DBDA_GOOGLE_APPLICATION_CREDENTIALS: {os.getenv('DBDA_GOOGLE_APPLICATION_CREDENTIALS')=}\n"
-        )
+        if self.service_key_env_var:
+            logger.success(f"Using service_key_env_var: {self.service_key_env_var}")
+            self.service_key_path = Path(
+                os.environ[self.service_key_env_var],
+            )
 
-        # if service_key and isinstance(service_key, ServiceKey):
-        if service_key and service_key.__class__.__name__ == "ServiceKey":
-            self.service_key = service_key
-        elif service_key_env_var:
-            service_key_path_str: str = os.environ[service_key_env_var]
-            self.service_key_path: Path = Path(service_key_path_str)
+        if self.service_key_path:
+            logger.success(f"Using service_key_path: {self.service_key_path}")
+            if isinstance(self.service_key_path, str):
+                self.service_key_path = Path(self.service_key_path)
             assert self.service_key_path.exists(), (
-                f"service_key_env_var provided not found: {service_key_path_str}"
+                f"service_key_path provided not found: {self.service_key_path}"
             )
-            self.service_key: ServiceKey = ServiceKey(
-                **json.loads(self.service_key_path.read_text())
-            )
-        elif isinstance(service_key_path, str | Path):
-            service_key_path: Path = (
-                Path(service_key_path)
-                if isinstance(service_key_path, str)
-                else service_key_path
-            )
-            self.service_key_path = service_key_path
-            assert self.service_key_path.exists(), (
-                f"service_key_path provided not found: {service_key_path}"
-            )
-            service_key_path_str: str = self.service_key_path.read_text()
-            self.service_key: ServiceKey = ServiceKey(
-                **json.loads(service_key_path_str)
-            )
-        elif GOOGLE_APPLICATION_CREDENTIALS := os.environ.get(
-            "DBDA_GOOGLE_APPLICATION_CREDENTIALS"
-        ):
-            self.service_key_path: Path = Path(GOOGLE_APPLICATION_CREDENTIALS)
-            assert self.service_key_path.exists(), (
-                f"DBDA_GOOGLE_APPLICATION_CREDENTIALS provided not found: {GOOGLE_APPLICATION_CREDENTIALS}"
-            )
-            service_key_path_str: str = self.service_key_path.read_text()
-            self.service_key: ServiceKey = ServiceKey(
-                **json.loads(service_key_path_str)
-            )
-        else:
+            self.service_key = json.loads(self.service_key_path.read_text())
+
+        if not self.service_key:
             raise Exception(
-                "Unexpected types:\n" + f"service_key: {type(service_key)=}\n"
-                if service_key
-                else "" + f"service_key_path: {type(service_key_path)=}\n"
-                if service_key_path
-                else "" + f"service_key_env_var: {type(service_key_env_var)=}\n"
-                if service_key_env_var
+                "Unexpected types:\n" + f"service_key: {type(self.service_key)=}\n"
+                if self.service_key
+                else "" + f"service_key_path: {type(self.service_key_path)=}\n"
+                if self.service_key_path
+                else "" + f"service_key_env_var: {type(self.service_key_env_var)=}\n"
+                if self.service_key_env_var
                 else ""
             )
-
-        self.sa_info: dict = self.service_key.model_dump()
 
     def build_service(self, scopes, short_name, version, credentials=None):
         self.credentials = (
             credentials
             or service_account.Credentials.from_service_account_info(
-                info=self.sa_info, scopes=scopes
+                info=self.service_key, scopes=scopes
             )
         )
         self.service = build(short_name, version, credentials=self.credentials)
@@ -113,9 +61,10 @@ class GService:
 
 
 def main():
-    g_service = GService()
-    print(type(g_service.sa_info))
-    print((g_service.sa_info))
+    g_service = GService(
+        service_key_env_var="DBDA_GOOGLE_APPLICATION_CREDENTIALS",
+    )
+    logger.success("Service key loaded successfully.")
 
 
 if __name__ == "__main__":
