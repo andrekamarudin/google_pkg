@@ -23,6 +23,7 @@ dependencies = [
     "plotly>=6.1.2,<7",
     "beautifulsoup4>=4.13.4",
     "google-auth-oauthlib>=1.2.2",
+    "returns>=0.25.0",
 ]
 
 [dependency-groups]
