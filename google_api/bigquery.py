@@ -290,25 +290,9 @@ class BigQuery:
         schema: list[bigquery.SchemaField] | None = None,
         silent: bool = False,
     ) -> None:
-        schema_result = self.get_schema(df, specify_dtypes)
-        if isinstance(schema_result, Failure):
-            logger.error(f"Failed to infer schema: {schema_result.failure()}")
-            return
-        schema = schema_result.value_or(None) if specify_dtypes else None
-
-        if batched:
-            rows: int = len(df)
-            batches: int = 20 if rows >= 20000 else 2
-            batch_size: int = rows // batches
-        else:
-            batches: int = 1
-            batch_size: int = len(df)
-
-        for i in tqdm(range(batches), desc="Uploading", unit="batch"):
-            start: int = i * batch_size
-            end: int = start + batch_size
+        def upload(df_slice, silent):
             self.bq_service.upload_df_to_bq(
-                df[start:end],
+                df_slice,
                 table_id=table_id,
                 dataset_id=dataset_id,
                 replace=replace,
@@ -316,9 +300,21 @@ class BigQuery:
                 silent=silent,
                 job_config=job_config,
             )
-            # Reset schema for subsequent inserts
-            schema = None
-            replace = False
+
+        if batched:
+            rows = len(df)
+            batches = 20 if rows >= 20000 else 2
+            batch_size = rows // batches
+            for i in tqdm(range(batches)):
+                schema_result: Result = self.get_schema(df, specify_dtypes)
+                schema = schema_result.value_or(None) if specify_dtypes else None
+                start = i * batch_size
+                end = start + batch_size
+                replace = replace if i == 0 else False
+                upload(df[start:end], silent)
+        else:
+            schema = schema or self.get_schema(df, specify_dtypes).value_or(None)
+            upload(df, silent)
 
     @safe
     def get_schema(
