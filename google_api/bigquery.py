@@ -241,12 +241,8 @@ class BigQuery:
             or result_dict.get("total_rows", 0) == 0
         ):
             # async or if the query was not a SELECT statement
-            result_df = (
-                pd.DataFrame([result_dict]).T
-                if len(result_dict) == 1
-                else pd.DataFrame(result_dict)
-            )
-            return result_df
+            result_df = pd.DataFrame([result_dict])
+            return result_df.T if len(result_dict) == 1 else result_df
 
         total_rows: int = result_dict["total_rows"]
         if sample_row_cnt == 0 or (total_rows <= sample_row_cnt):
@@ -868,8 +864,16 @@ class BigQueryService:
         )
 
 
-bq = BigQuery(project="ne-fprt-data-cloud-production")
-result = bq._query(
-    "SELECT * FROM `fairprice-bigquery.dev_dbda.bq_query_history` ",
-    wait_for_results=False,
-)
+def main():
+    bq = BigQuery(project="ne-fprt-data-cloud-production")
+    return bq._query(
+        "SELECT * FROM `fairprice-bigquery.dev_dbda.bq_query_history` ",
+        wait_for_results=False,
+    )
+
+
+if __name__ == "__main__":
+    logger.remove()
+    LOG_FMT = "<level>{level}: {message}</level> <black>({file} / {module} / {function} / {line})</black>"
+    logger.add(sys.stdout, level="SUCCESS", format=LOG_FMT)
+    main()

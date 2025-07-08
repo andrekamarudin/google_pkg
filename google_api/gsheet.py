@@ -7,7 +7,7 @@ import pandas as pd
 from googleapiclient.errors import HttpError
 from loguru import logger
 
-from google_api.packages.gservice import GService, ServiceKey
+from google_api.packages.gservice import GService
 
 
 class GSheetAPI(GService):
@@ -27,7 +27,7 @@ class GSheetAPI(GService):
         value=None,
         range: Optional[str] = None,
         spreadsheet_id: Optional[str] = None,
-        service_key: Optional[ServiceKey] = None,
+        service_key: Optional[dict] = None,
         service_key_path: Optional[Path | str] = None,
         service_key_env_var: Optional[str] = None,
     ) -> None:
@@ -47,9 +47,9 @@ class GSheetAPI(GService):
             )
 
         if value is not None:
-            assert (
-                spreadsheet_id is not None
-            ), "Spreadsheet ID must be specified for value to be appended"
+            assert spreadsheet_id is not None, (
+                "Spreadsheet ID must be specified for value to be appended"
+            )
             self.value = value
             self.append_row(self.value, self.range, self.spreadsheet_id)
         logger.success("Initialized GSheetAPI")

@@ -5,7 +5,7 @@ from typing import Optional
 
 import pandas as pd
 
-from google_api.packages.gservice import GService, ServiceKey
+from google_api.packages.gservice import GService
 
 
 class GCal(GService):
@@ -36,7 +36,7 @@ class GCal(GService):
     def __init__(
         self,
         service_key_path: Optional[Path] = None,
-        service_key: Optional[ServiceKey] = None,
+        service_key: Optional[dict] = None,
     ):
         """
         Initializes the GCal object.
