@@ -392,7 +392,7 @@ class GmailUI(GmailService):
     def all_decisions(self) -> Dict[str, Callable]:
         return {**self.search_decisions, **self.email_decisions}
 
-    async def main_loop(self, query: Optional[str] = None) -> None:
+    def main_loop(self, query: Optional[str] = None) -> None:
         while True:
             search_query: str = query or input("Enter search query: ") or "is:unread"
             search_results: List[Dict[str, Any]] = self.search(search_query)
@@ -406,7 +406,7 @@ class GmailUI(GmailService):
                     ).lower()
                 if decision == "q":
                     break
-                await self.all_decisions[decision](
+                self.all_decisions[decision](
                     msg_id=email["id"], thread_id=email["threadId"], headers=headers
                 )
 
@@ -451,7 +451,7 @@ if __name__ == "__main__":
             r"c:\Users\andre\OneDrive\Apps\ANDRE_GOOGLE_APPLICATION_CREDENTIALS.json"
         ),
     )
-    asyncio.run(gmail.main_loop())
+    gmail.main_loop()
 
 
 # %%
