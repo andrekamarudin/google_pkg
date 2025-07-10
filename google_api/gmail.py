@@ -1,8 +1,8 @@
 # %%
-import asyncio
 import base64
 import os
 import pickle
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from email import policy
 from email.message import Message
 from email.mime.multipart import MIMEMultipart
@@ -145,14 +145,20 @@ class GmailService:
         )
         content_type: str = email_message.get_content_type()
         if content_type == "text/plain":
-            return email_message.get_content()
+            return str(email_message.get_payload())
         elif content_type == "text/html":
-            html_content = email_message.get_content()
+            html_content = str(email_message.get_payload())
             soup = BeautifulSoup(html_content, "html.parser")
             return soup.get_text()
         elif content_type == "multipart/alternative":
-            for part in email_message.iter_parts():
-                content = self._message_to_content(part)
+            content = None
+            payload = email_message.get_payload()
+            if isinstance(payload, list):
+                for part in payload:
+                    if isinstance(part, Message):
+                        content = self._message_to_content(part)
+                        if content:
+                            break
             if content:
                 return content
             else:
@@ -160,6 +166,15 @@ class GmailService:
         elif content_type == "application/octet-stream":
             content = "(application/octet-stream content found)"
             return content
+        else:
+            # Try to get payload as string for other content types
+            try:
+                return str(email_message.get_payload())
+            except Exception as e:
+                logger.warning(
+                    f"Error getting payload for content type {content_type}: {e}"
+                )
+                return f"(unsupported content type: {content_type})"
 
     def _payload_to_body(self, message_payload: str) -> str:
         raw_email: bytes = base64.urlsafe_b64decode(message_payload)
@@ -169,8 +184,13 @@ class GmailService:
         body: str = self._message_to_content(email_message) or ""
         if not body and email_message.is_multipart():
             body = ""
-            for part in email_message.iter_parts():
-                body += self._message_to_content(part) or ""
+            payload = email_message.get_payload()
+            if isinstance(payload, list):
+                for part in payload:
+                    if isinstance(part, Message):
+                        part_content = self._message_to_content(part)
+                        if part_content:
+                            body += part_content
         if body:
             return body
         else:
@@ -194,26 +214,64 @@ class GmailService:
                 return label["id"]
         return None
 
-    async def _mod_label(
+    def _mod_label(
         self, msg_id: str, label: Label, to_add: bool = True
     ) -> Dict[str, Any] | None:
         if label_id := label.value:
-            response = await (
-                self.gservice.service.users()
-                .messages()
-                .modify(
-                    userId=self.user_id,
-                    id=msg_id,
-                    body={f"{'add' if to_add else 'remove'}LabelIds": [label_id]},
+            try:
+                response = (
+                    self.gservice.service.users()
+                    .messages()
+                    .modify(
+                        userId=self.user_id,
+                        id=msg_id,
+                        body={f"{'add' if to_add else 'remove'}LabelIds": [label_id]},
+                    )
+                    .execute()
                 )
-                .execute()  # Remove await here
-            )
-            return response  # Return the response directly
+                return response
+            except Exception as e:
+                logger.error(f"Error modifying label for message {msg_id}: {e}")
+                return None
         else:
             return None
 
 
 class GmailUI(GmailService):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._executor = ThreadPoolExecutor(max_workers=10)
+
+    def _run_in_thread(
+        self, func_list: List[Callable], error_context: str = "operation"
+    ) -> None:
+        """Run multiple functions in threads with proper error handling"""
+
+        def run_with_error_handling(func):
+            try:
+                return func()
+            except Exception as e:
+                logger.error(f"Error in {error_context}: {e}")
+                print(f"Error in {error_context}: {e}")
+                raise
+
+        futures = [
+            self._executor.submit(run_with_error_handling, func) for func in func_list
+        ]
+
+        # Wait for all to complete and collect any exceptions
+        exceptions = []
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                exceptions.append(e)
+
+        if exceptions:
+            logger.error(f"Multiple errors occurred in {error_context}: {exceptions}")
+            for exc in exceptions:
+                print(f"Error: {exc}")
+
     def search(self, query: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         self.last_query = query
         msg_dicts: List[Dict[str, Any]] = (
@@ -232,62 +290,68 @@ class GmailUI(GmailService):
                 logger.success("Returning last {} messages", limit)
             return msg_dicts
 
-    async def move_to_inbox(
+    def move_to_inbox(
         self, msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
     ) -> None:
-        await asyncio.gather(
-            self._mod_label(msg_id, Label.SPAM, to_add=False),
-            self._mod_label(msg_id, Label.TRASH, to_add=False),
-            self._mod_label(msg_id, Label.INBOX),
-        )
+        funcs = [
+            lambda: self._mod_label(msg_id, Label.SPAM, to_add=False),
+            lambda: self._mod_label(msg_id, Label.TRASH, to_add=False),
+            lambda: self._mod_label(msg_id, Label.INBOX),
+        ]
+        self._run_in_thread(funcs, f"moving {msg_id} to inbox")
         print(f"Moved {msg_id} to inbox email")
 
-    async def mark_as_ttd(
+    def mark_as_ttd(
         self, msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
     ) -> None:
-        await asyncio.gather(
-            self._mod_label(msg_id, Label.TTD),
-            self._mod_label(msg_id, Label.INBOX, to_add=False),
-        )
-        await self._mod_label(msg_id, Label.INBOX, to_add=False)
+        funcs = [
+            lambda: self._mod_label(msg_id, Label.TTD),
+            lambda: self._mod_label(msg_id, Label.INBOX, to_add=False),
+        ]
+        self._run_in_thread(funcs, f"marking {msg_id} as TTD")
+        self._mod_label(msg_id, Label.INBOX, to_add=False)
         print(f"Marked {msg_id} as TTD email")
 
-    async def mark_as_read(
+    def mark_as_read(
         self, msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
     ) -> None:
-        await asyncio.gather(
-            self._mod_label(msg_id, Label.UNREAD, to_add=False),
-        )
+        funcs = [
+            lambda: self._mod_label(msg_id, Label.UNREAD, to_add=False),
+        ]
+        self._run_in_thread(funcs, f"marking {msg_id} as read")
         print(f"Marked {msg_id} as read email")
 
-    async def delete_email(
+    def delete_email(
         self, msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
     ) -> None:
         try:
-            await asyncio.gather(
-                self._mod_label(msg_id, Label.TTD, to_add=False),
-                self._mod_label(msg_id, Label.TRASH),
-            )
+            funcs = [
+                lambda: self._mod_label(msg_id, Label.TTD, to_add=False),
+                lambda: self._mod_label(msg_id, Label.TRASH),
+            ]
+            self._run_in_thread(funcs, f"deleting {msg_id}")
             print(f"Deleted {msg_id}")
         except Exception as e:
             logger.error(f"Failed to delete email {msg_id}: {e}")
 
-    async def archive_email(
+    def archive_email(
         self, msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
     ) -> None:
-        await asyncio.gather(
-            self._mod_label(msg_id, Label.INBOX, to_add=False),
-            self._mod_label(msg_id, Label.TTD, to_add=False),
-        )
+        funcs = [
+            lambda: self._mod_label(msg_id, Label.INBOX, to_add=False),
+            lambda: self._mod_label(msg_id, Label.TTD, to_add=False),
+        ]
+        self._run_in_thread(funcs, f"archiving {msg_id}")
         print(f"Archived {msg_id}")
 
-    async def mark_as_spam(
+    def mark_as_spam(
         self, msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
     ) -> None:
-        await asyncio.gather(
-            self._mod_label(msg_id, Label.SPAM),
-            self._mod_label(msg_id, Label.INBOX, to_add=False),
-        )
+        funcs = [
+            lambda: self._mod_label(msg_id, Label.SPAM),
+            lambda: self._mod_label(msg_id, Label.INBOX, to_add=False),
+        ]
+        self._run_in_thread(funcs, f"marking {msg_id} as spam")
         print(f"Marked {msg_id} as spam")
 
     def open_msg(
@@ -305,7 +369,7 @@ class GmailUI(GmailService):
             f"{key}: {func.__name__}" for key, func in options_dict.items()
         )
 
-    async def _batch_process(
+    def _batch_process(
         self,
         msgs: List[Dict[str, Any]],
         decision: str,
@@ -320,23 +384,37 @@ class GmailUI(GmailService):
             disable=len(msgs) < 10,  # Disable progress bar for small batches
         )
 
-        async def act(
-            msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
-        ) -> None:
+        def process_email(msg: Dict[str, Any]) -> None:
             try:
-                function_to_call(msg_id, thread_id, headers)
+                function_to_call(
+                    msg_id=msg["id"], thread_id=msg["threadId"], headers=headers
+                )
             except Exception as e:
-                logger.error(f"Error processing {msg_id}: {e}")
-            qbar.update(1)
+                logger.error(f"Error processing {msg['id']}: {e}")
+                print(f"Error processing {msg['id']}: {e}")
+            finally:
+                qbar.update(1)
 
-        await asyncio.gather(
-            *[
-                act(msg_id=msg["id"], thread_id=msg["threadId"], headers=headers)
-                for msg in msgs
-            ]
-        )
+        # Use ThreadPoolExecutor for concurrent processing
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(process_email, msg) for msg in msgs]
 
-    async def _batch_decision(
+            # Wait for all to complete and collect any exceptions
+            exceptions = []
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    exceptions.append(e)
+
+            if exceptions:
+                logger.error(f"Batch processing had {len(exceptions)} errors")
+                for exc in exceptions:
+                    print(f"Batch error: {exc}")
+
+        qbar.close()
+
+    def _batch_decision(
         self, criteria: Criteria, headers: Optional[EmailHeaders] = None
     ) -> None:
         operator = criteria.value["operator"]
@@ -352,22 +430,22 @@ class GmailUI(GmailService):
             else:
                 break
 
-        return await self._batch_process(all_msgs, decision, headers)
+        return self._batch_process(all_msgs, decision, headers)
 
-    async def handle_sender(
+    def handle_sender(
         self, msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
     ) -> None:
-        await self._batch_decision(Criteria.SENDER, headers)
+        self._batch_decision(Criteria.SENDER, headers)
 
-    async def handle_thread(
+    def handle_thread(
         self, msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
     ) -> None:
-        await self._batch_decision(Criteria.THREAD_ID, headers)
+        self._batch_decision(Criteria.THREAD_ID, headers)
 
-    async def handle_subject(
+    def handle_subject(
         self, msg_id: str, thread_id: str, headers: Optional[EmailHeaders] = None
     ) -> None:
-        await self._batch_decision(Criteria.SUBJECT, headers)
+        self._batch_decision(Criteria.SUBJECT, headers)
 
     @property
     def email_decisions(self) -> Dict[str, Callable]:
