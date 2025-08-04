@@ -20,7 +20,6 @@ from google.cloud.bigquery.table import RowIterator
 from google.oauth2 import service_account
 from icecream import ic  # noqa
 from loguru import logger
-from returns.result import Failure, Result, Success, safe
 from tqdm import tqdm
 
 sys.path.extend([str(x) for x in Path(__file__).parents])
@@ -132,16 +131,14 @@ class BigQuery:
         skip_dry_run: bool = False,
         *args,
         **kwargs,
-    ) -> Result[dict[str, Any], Exception]:
+    ) -> dict[str, Any]:
         project = project or self.project
 
         if not skip_dry_run:
             dry_run_result = self._dry_run(sql, project)
-            if isinstance(dry_run_result, Failure):
+            if not dry_run_result.get("success", False):
                 return dry_run_result
-            query_size: float = dry_run_result.map(
-                lambda x: x["bytes_processed"] / 1e9
-            ).value_or(0.0)
+            query_size: float = dry_run_result.get("bytes_processed", 0) / 1e9
             if query_size > 5:
                 logger.warning(f"Query bytes: {query_size:,.2f} GB")
 
@@ -152,7 +149,7 @@ class BigQuery:
         start_time: float = time.time()
         job: bigquery.QueryJob = self.client.query(sql)
         if not wait_for_results:
-            return Success({"job": job, "job_id": job.job_id})
+            return {"job": job, "job_id": job.job_id}
 
         try:
             job_result: RowIterator = job.result(page_size=page_size)
@@ -170,15 +167,15 @@ class BigQuery:
                 message += f"\n{row_cnt:,.0f} rows affected."
                 message += f"Result stored in {job.destination}"
             logger.success(message)
-            return Success(
-                {
-                    "ddl_type": job.statement_type,
-                    "rows_affected": job.num_dml_affected_rows,
-                    "target_table": job.destination,
-                    "duration": duration,
-                    "job_id": job.job_id,
-                }
-            )
+            return {
+                "success": True,
+                "ddl_type": job.statement_type,
+                "rows_affected": job.num_dml_affected_rows,
+                "target_table": job.destination,
+                "duration": duration,
+                "job_id": job.job_id,
+            }
+
         elif job_result.total_rows is not None:
             # SELECT query
             message += f"\n{job_result.total_rows:,.0f} rows returned"
@@ -191,16 +188,15 @@ class BigQuery:
 
         job_sample: RowIterator = job.result(max_results=sample_row_cnt)
 
-        return Success(
-            {
-                "message": message,
-                "job_result": job_result,
-                "total_rows": job_result.total_rows,
-                "job_sample": job_sample,
-                "duration": duration,
-                "job_id": job.job_id,
-            }
-        )
+        return {
+            "success": True,
+            "message": message,
+            "job_result": job_result,
+            "total_rows": job_result.total_rows,
+            "job_sample": job_sample,
+            "duration": duration,
+            "job_id": job.job_id,
+        }
 
     def q(
         self,
@@ -218,22 +214,18 @@ class BigQuery:
         :return: DataFrame containing the query results
         """
         if self.dry_run_only:
-            dry_run_result: Result[dict[str, Any], Exception] = self._dry_run(
-                sql, project
-            )
+            dry_run_result: dict[str, Any] = self._dry_run(sql, project)
             return pd.DataFrame([dry_run_result])
 
-        result: Result[dict[str, Any], Exception] = self._query(
+        result_dict: dict[str, Any] = self._query(
             sql=sql,
             project=project,
             sample_row_cnt=sample_row_cnt,
             wait_for_results=wait_for_results,
         )
 
-        if isinstance(result, Failure):
+        if not result_dict.get("success", False):
             raise sys.exit()
-
-        result_dict: dict[str, Any] = result.value_or({})
 
         if (
             not wait_for_results
@@ -283,56 +275,50 @@ class BigQuery:
         df,
         table_id,
         dataset_id,
+        project: Optional[str] = None,
         replace: bool = False,
         job_config: Optional[bigquery.LoadJobConfig] = None,
-        specify_dtypes: bool = False,
         batched: bool = False,
         schema: list[bigquery.SchemaField] | None = None,
         silent: bool = False,
     ) -> None:
-        def upload(df_slice, silent):
-            self.bq_service.upload_df_to_bq(
-                df_slice,
-                table_id=table_id,
-                dataset_id=dataset_id,
-                replace=replace,
-                schema=schema,
-                silent=silent,
-                job_config=job_config,
-            )
+        upload: partial[_AsyncJob] = partial(
+            self.bq_service.upload_df_to_bq,
+            table_id=table_id,
+            dataset_id=dataset_id,
+            project=project or self.project,
+            replace=replace,
+            silent=silent,
+            schema=schema or self.get_schema(df=df),
+            job_config=job_config,
+        )
 
         if batched:
-            rows = len(df)
-            batches = 20 if rows >= 20000 else 2
-            batch_size = rows // batches
+            rows: int = len(df)
+            batches: int = 20 if rows >= 20000 else 2
+            batch_size: int = rows // batches
             for i in tqdm(range(batches)):
-                schema_result: Result = self.get_schema(df, specify_dtypes)
-                schema = schema_result.value_or(None) if specify_dtypes else None
-                start = i * batch_size
-                end = start + batch_size
+                start: int = i * batch_size
+                end: int = start + batch_size
                 replace = replace if i == 0 else False
-                upload(df[start:end], silent)
+                upload(df_slice=df[start:end])
         else:
-            schema = schema or self.get_schema(df, specify_dtypes).value_or(None)
-            upload(df, silent)
+            upload(df_slice=df)
 
-    @safe
-    def get_schema(
-        self, df: pd.DataFrame, specify_dtypes: bool
-    ) -> list[bigquery.SchemaField]:
+    def get_schema(self, df: pd.DataFrame) -> list[bigquery.SchemaField]:
         logger.info("Attempting to infer schema from DataFrame")
-        column_names = df.columns.tolist()
-        common_dtypes = [
-            "STRING",
-            "INTEGER",
-            "FLOAT",
-            "DATETIME",
-            "TIMESTAMP",
-            "DATE",
-            "TIME",
-            "BOOLEAN",
-        ]
-        column_dtypes = {}
+        column_names: list[str] = df.columns.tolist()
+        common_dtypes: dict[str, str] = {
+            "STRING": "str",
+            "INTEGER": "int",
+            "FLOAT": "float",
+            "DATETIME": "datetime",
+            "TIMESTAMP": "timestamp",
+            "DATE": "date",
+            "TIME": "time",
+            "BOOLEAN": "bool",
+        }
+        column_dtypes: dict[str, str] = {}
         for column in column_names:
             os.system("cls")
             example_values = df[column].dropna().unique()[:5].tolist()
@@ -340,36 +326,48 @@ class BigQuery:
             print("Example values: ", example_values)
             print("Please select the data type from the following options:")
             print(Fore.LIGHTBLACK_EX, end="")
-            for i, dtype in enumerate(common_dtypes):
+            for i, dtype in enumerate(common_dtypes.keys()):
                 print(f"{i + 1}. {dtype}")
-            user_input = input(
+            user_input: str = input(
                 f"Enter the number corresponding to the data type: {Fore.GREEN}"
             )
-            dtype_index = int(user_input) - 1
-            column_dtypes[column] = common_dtypes[dtype_index]
+            if user_input.isdigit() and (1 <= int(user_input) <= len(common_dtypes)):
+                dtype_index: int = int(user_input) - 1
+                matched_type = list(common_dtypes.keys())[dtype_index]
+            else:
+                matched_type: str = next(
+                    (
+                        bq_type
+                        for bq_type, py_type in common_dtypes.items()
+                        if example_values and py_type in str(type(example_values[0]))
+                    ),
+                    "STRING",
+                )
+
+            column_dtypes[column] = matched_type
             print(Style.RESET_ALL)
-        schema = [
-            bigquery.SchemaField(name, dtype) for name, dtype in column_dtypes.items()
+
+        schema: list[bigquery.SchemaField] = [
+            bigquery.SchemaField(name=name, field_type=dtype)
+            for name, dtype in column_dtypes.items()
         ]
         logger.success(f"Schema inferred successfully: {schema}")
         return schema
 
-    def _dry_run(
-        self, sql: str, project: Optional[str] = None
-    ) -> Result[dict[str, Any], Exception]:
+    def _dry_run(self, sql: str, project: Optional[str] = None) -> dict[str, Any]:
         project = project or self.project
         job_config = bigquery.QueryJobConfig(dry_run=True)
         try:
             job: bigquery.QueryJob = self.client.query(sql, job_config=job_config)
-            return Success(
-                {
-                    "bytes_processed": job.total_bytes_processed,
-                    "statement_type": job.statement_type,
-                }
-            )
+            return {
+                "success": True,
+                "bytes_processed": job.total_bytes_processed,
+                "statement_type": job.statement_type,
+            }
+
         except Exception as e:
-            self._show_error(e, sql)
-            return Failure(e)
+            self._show_error(error=e, sql=sql)
+            return {"success": False, "error": str(e)}
 
     def _show_error(self, error, sql: str) -> str:
         match: re.Match[str] | None = re.search(r"at \[(\d+):(\d+)\]", str(error))
@@ -775,9 +773,11 @@ class BigQueryService:
             write_disposition="WRITE_TRUNCATE" if replace else "WRITE_APPEND",
         )
 
-        table_ref = self.get_table(table_id, dataset_id, project)
-        job = self.client.load_table_from_dataframe(
-            df, table_ref, job_config=job_config
+        table_ref: bigquery.Table | bigquery.TableReference = self.get_table(
+            table_id=table_id, dataset_id=dataset_id, project=project
+        )
+        job: bigquery.LoadJob = self.client.load_table_from_dataframe(
+            dataframe=df, destination=table_ref, job_config=job_config
         )
         if not silent:
             logger.success(
@@ -822,7 +822,6 @@ class BigQueryService:
             logger.error(f"Table {table_id} does not exist. Continuing in 5 seconds...")
             return table_ref
 
-    @safe
     def get_running_jobs(self) -> list[bigquery.QueryJob]:
         return list(
             self.client.list_jobs(
@@ -833,7 +832,6 @@ class BigQueryService:
             )
         )
 
-    @safe
     def cancel_job(self, job_id: str, project: Optional[str] = None) -> _AsyncJob:
         project = project or self.project
         return self.client.cancel_job(job_id, project=project)
