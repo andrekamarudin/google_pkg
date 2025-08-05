@@ -1,5 +1,4 @@
 import re
-import sys
 from pathlib import Path
 from typing import Any, Optional
 
@@ -319,6 +318,4 @@ def main():
 
 
 if __name__ == "__main__":
-    logger.remove()
-    logger.add(sys.stderr, level="INFO")
     main()

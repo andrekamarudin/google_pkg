@@ -1,5 +1,4 @@
 import json
-import sys
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, List, Optional, Union
@@ -10,10 +9,6 @@ import requests
 from loguru import logger
 
 from google_api.packages.helper import condense_text
-
-logger.remove()
-LOG_FMT = "<level>{level}: {message}</level> <black>({file} / {module} / {function} / {line})</black>"
-logger.add(sys.stdout, level="SUCCESS", format=LOG_FMT)
 
 
 @dataclass

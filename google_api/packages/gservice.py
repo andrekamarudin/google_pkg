@@ -1,7 +1,5 @@
 import json
 import os
-import sys
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -68,7 +66,4 @@ def main():
 
 
 if __name__ == "__main__":
-    logger.remove()
-    LOG_FMT = "<level>{level}: {message}</level> <black>({file} / {module} / {function} / {line})</black>"
-    logger.add(sys.stdout, level="SUCCESS", format=LOG_FMT)
     main()

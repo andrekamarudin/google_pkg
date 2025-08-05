@@ -18,7 +18,6 @@ from google.cloud import bigquery
 from google.cloud.bigquery.job.base import _AsyncJob
 from google.cloud.bigquery.table import RowIterator
 from google.oauth2 import service_account
-from icecream import ic  # noqa
 from loguru import logger
 from tqdm import tqdm
 
@@ -27,10 +26,6 @@ from packages.charting import chart
 from packages.gservice import GService
 
 indent = partial(_indent, prefix="    ")
-
-logger.remove()
-LOG_FMT = "<level>{level}: {message}</level> <black>({file} / {module} / {function} / {line})</black>"
-logger.add(sys.stdout, level="SUCCESS", format=LOG_FMT)
 
 
 class BigQuery:
@@ -282,14 +277,19 @@ class BigQuery:
         schema: list[bigquery.SchemaField] | None = None,
         silent: bool = False,
     ) -> None:
+        if self.dry_run_only:
+            logger.warning("Dry run only mode is enabled. Skipping upload to BigQuery.")
+            return
+        project = project or self.project
+        schema = schema or self.get_schema(df=df)
         upload: partial[_AsyncJob] = partial(
             self.bq_service.upload_df_to_bq,
             table_id=table_id,
             dataset_id=dataset_id,
-            project=project or self.project,
+            project=project,
             replace=replace,
             silent=silent,
-            schema=schema or self.get_schema(df=df),
+            schema=schema,
             job_config=job_config,
         )
 
@@ -867,7 +867,4 @@ def main():
 
 
 if __name__ == "__main__":
-    logger.remove()
-    LOG_FMT = "<level>{level}: {message}</level> <black>({file} / {module} / {function} / {line})</black>"
-    logger.add(sys.stdout, level="SUCCESS", format=LOG_FMT)
     main()
