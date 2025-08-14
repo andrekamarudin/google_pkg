@@ -220,15 +220,14 @@ class BigQuery:
         )
 
         if not result_dict.get("success", False):
-            raise sys.exit()
+            raise sys.exit(str(result_dict))
 
-        if (
-            not wait_for_results
-            or ("job_result" not in result_dict)
-            or result_dict.get("total_rows", 0) == 0
-        ):
+        result_df = pd.DataFrame([result_dict])
+        if result_dict.get("total_rows", 0) == 0:
+            logger.warning("\n" + result_df.T.to_markdown(index=False))
+            return pd.DataFrame()
+        elif not wait_for_results or ("job_result" not in result_dict):
             # async or if the query was not a SELECT statement
-            result_df = pd.DataFrame([result_dict])
             return result_df.T if len(result_dict) == 1 else result_df
 
         total_rows: int = result_dict["total_rows"]
