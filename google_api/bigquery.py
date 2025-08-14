@@ -276,12 +276,14 @@ class BigQuery:
         batched: bool = False,
         schema: list[bigquery.SchemaField] | None = None,
         silent: bool = False,
+        request_schema: bool = False,
     ) -> None:
         if self.dry_run_only:
             logger.warning("Dry run only mode is enabled. Skipping upload to BigQuery.")
             return
         project = project or self.project
-        schema = schema or self.get_schema(df=df)
+        if not schema and request_schema:
+            schema = schema or self.get_schema(df=df)
         upload: partial[_AsyncJob] = partial(
             self.bq_service.upload_df_to_bq,
             table_id=table_id,
@@ -301,9 +303,9 @@ class BigQuery:
                 start: int = i * batch_size
                 end: int = start + batch_size
                 replace = replace if i == 0 else False
-                upload(df_slice=df[start:end])
+                upload(df=df[start:end])
         else:
-            upload(df_slice=df)
+            upload(df=df)
 
     def get_schema(self, df: pd.DataFrame) -> list[bigquery.SchemaField]:
         logger.info("Attempting to infer schema from DataFrame")
