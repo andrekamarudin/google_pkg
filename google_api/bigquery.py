@@ -758,6 +758,22 @@ class BigQueryService:
         )
         self.client = bigquery.Client(project=project, credentials=self.credentials)
 
+    def _normalize_datetimes_for_bq(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Normalize datetime columns for BigQuery compatibility.
+        Why? Pandas uses nanosecond datetime precision (datetime64[ns]). BigQuery stores microseconds. PyArrow refuses to silently downcast, so it throws: “Casting from timestamp[ns] to timestamp[us] would lose data.”
+        """
+        df = df.copy()
+        # 1) Make tz-aware columns UTC, then drop tz info, since BigQuery TIMESTAMP is UTC based.
+        for col in df.select_dtypes(include=["datetimetz"]).columns:
+            df[col] = df[col].dt.tz_convert("UTC").dt.tz_localize(None)
+
+        # 2) Round nanoseconds to microseconds, then cast to microsecond precision.
+        dt_cols: pd.Index[str] = df.select_dtypes(include=["datetime64[ns]"]).columns
+        for col in dt_cols:
+            df[col] = df[col].dt.round("us").astype("datetime64[us]")
+        return df
+
     def upload_df_to_bq(
         self,
         df: pd.DataFrame,
@@ -770,6 +786,7 @@ class BigQueryService:
         job_config: Optional[bigquery.LoadJobConfig] = None,
     ) -> _AsyncJob:
         project = project or self.project
+        df = self._normalize_datetimes_for_bq(df)
         job_config = job_config or bigquery.LoadJobConfig(
             schema=schema,
             write_disposition="WRITE_TRUNCATE" if replace else "WRITE_APPEND",
