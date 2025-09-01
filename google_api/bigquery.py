@@ -102,14 +102,15 @@ class BigQuery:
             return job_result.to_dataframe()
 
         qbar = tqdm(
-            total=(job_result.total_rows // 10_000 + 1 if job_result.total_rows else 0),
-            unit="page",
-            desc="Loading to dataframe",
+            total=job_result.total_rows,
+            unit=" rows",
+            desc="Load to df",
         )
         results: list[dict] = []
         for page in job_result.pages:
             results += [dict(row) for row in page]
-            qbar.update(1)
+            qbar.n = len(results)
+            qbar.refresh()
         return pd.DataFrame(results)
 
     def wait_for_job(self, job: bigquery.QueryJob, *args, **kwargs) -> RowIterator:
@@ -877,10 +878,11 @@ class BigQueryService:
 
 
 def main():
-    bq = BigQuery(project="ne-fprt-data-cloud-production")
-    return bq._query(
-        "SELECT * FROM `fairprice-bigquery.dev_dbda.bq_query_history` ",
-        wait_for_results=False,
+    bq = BigQuery(project="andrekamarudin")
+
+    return bq.q(
+        "SELECT * FROM `andrekamarudin.ura_ods.txn_clean` order by price desc, contract_date desc, floor",
+        sample_row_cnt=0,
     )
 
 
