@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from functools import partial
 from pathlib import Path
 from textwrap import indent as _indent
+from textwrap import shorten
 from typing import Any, Optional, Set
 
 import emojis
@@ -146,7 +147,7 @@ class BigQuery:
             if query_size > 5:
                 logger.warning(f"Query bytes: {query_size:,.2f} GB")
 
-        sql_extract = re.sub(r"[\s\n]+", " ", sql)[:150]
+        sql_extract = shorten(sql, 150, drop_whitespace=True)
         logger.success(sql_extract)
         self._last_sql = sql  # Store the last SQL query for reference
 

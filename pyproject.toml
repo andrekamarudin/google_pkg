@@ -27,6 +27,7 @@ dependencies = [
     "tabulate>=0.9.0",
     "termcolor>=3.1.0",
     "aklog",
+    "loguru>=0.7.3",
 ]
 
 [dependency-groups]
