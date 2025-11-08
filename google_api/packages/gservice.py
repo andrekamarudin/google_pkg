@@ -4,9 +4,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import emojis
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from loguru import logger
+
+from aklog import AKLog
+
+logger = AKLog(app_icon=emojis.encode(":gear:"))
 
 
 @dataclass

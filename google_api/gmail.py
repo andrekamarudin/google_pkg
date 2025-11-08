@@ -14,14 +14,18 @@ from pathlib import Path
 from pprint import pformat, pprint
 from typing import Any, Callable, Dict, List, Optional
 
+import emojis
 from bs4 import BeautifulSoup
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
-from loguru import logger
 from packages.gservice import GService
 from packages.helper import condense_text
 from pydantic import BaseModel
 from tqdm import tqdm
+
+from aklog import AKLog
+
+logger = AKLog(app_icon=emojis.encode(":email:"))
 
 
 class Criteria(Enum):

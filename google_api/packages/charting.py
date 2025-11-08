@@ -1,12 +1,15 @@
 # %%
 
-import sys
 from typing import TYPE_CHECKING
 
+import emojis
 import pandas as pd
 import plotly.express as px
-from loguru import logger
 from plotly.graph_objs._figure import Figure
+
+from aklog import AKLog
+
+logger = AKLog(app_icon=emojis.encode(":chart:"))
 
 if TYPE_CHECKING:
     import gradio as gr

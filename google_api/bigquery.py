@@ -9,23 +9,31 @@ from pathlib import Path
 from textwrap import indent as _indent
 from typing import Any, Optional, Set
 
+import emojis
 import numpy as np
 import pandas as pd
-from colorama import Fore, Style
+from colorama import Fore
 from dateutil.relativedelta import relativedelta
 from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 from google.cloud.bigquery.job.base import _AsyncJob
 from google.cloud.bigquery.table import RowIterator
 from google.oauth2 import service_account
-from loguru import logger
+from termcolor import cprint
 from tqdm import tqdm
+
+from aklog import AKLog
 
 sys.path.extend([str(x) for x in Path(__file__).parents])
 from packages.charting import chart
 from packages.gservice import GService
 
+logger = AKLog(app_icon=emojis.encode(":oil_drum:"))
 indent = partial(_indent, prefix="    ")
+
+print_yellow = partial(cprint, color="yellow")
+print_red = partial(cprint, color="red")
+print_green = partial(cprint, color="green")
 
 
 class BigQuery:
@@ -324,15 +332,13 @@ class BigQuery:
         for column in column_names:
             os.system("cls")
             example_values = df[column].dropna().unique()[:5].tolist()
-            print(f"{Fore.YELLOW}Column: {column}")
-            print("Example values: ", example_values)
-            print("Please select the data type from the following options:")
-            print(Fore.LIGHTBLACK_EX, end="")
+            print_yellow(f"Column: {column}")
+            print_yellow("Example values: ", example_values)
+            print_yellow("Please select the data type from the following options:")
             for i, dtype in enumerate(common_dtypes.keys()):
-                print(f"{i + 1}. {dtype}")
-            user_input: str = input(
-                f"Enter the number corresponding to the data type: {Fore.GREEN}"
-            )
+                print_yellow(f"{i + 1}. {dtype}")
+            print_green("Enter the number corresponding to the data type: ")
+            user_input: str = input()
             if user_input.isdigit() and (1 <= int(user_input) <= len(common_dtypes)):
                 dtype_index: int = int(user_input) - 1
                 matched_type = list(common_dtypes.keys())[dtype_index]
@@ -347,7 +353,6 @@ class BigQuery:
                 )
 
             column_dtypes[column] = matched_type
-            print(Style.RESET_ALL)
 
         schema: list[bigquery.SchemaField] = [
             bigquery.SchemaField(name=name, field_type=dtype)
@@ -369,6 +374,7 @@ class BigQuery:
 
         except Exception as e:
             self._show_error(error=e, sql=sql)
+            print_red(f"SQL dry run failed: {e}")
             return {"success": False, "error": str(e)}
 
     def _show_error(self, error, sql: str) -> str:
@@ -389,15 +395,20 @@ class BigQuery:
             line: str = sql_lines[line_no]
             lb: str = "\n"
             lines_colored: str = (
-                rf"{Fore.LIGHTYELLOW_EX}{lb}"
-                r"```"
+                rf"{lb}"
                 rf"{lb.join(lines_bef)}{lb}"
                 rf"{line[:char_no]}{Fore.LIGHTRED_EX}{line[char_no:]}{Fore.LIGHTYELLOW_EX}{lb}"
                 rf"{lb.join(lines_aft)}"
-                r"```"
-                rf"{Fore.RESET}"
             )
-            logger.error(f"\n{error_to_print}\n{lines_colored.lstrip(lb)}")
+            print_yellow(f"\n{error_to_print}\n{lines_colored.lstrip(lb)}")
+            # lines_colored: str = (
+            #     rf"{Fore.LIGHTYELLOW_EX}{lb}"
+            #     rf"{lb.join(lines_bef)}{lb}"
+            #     rf"{line[:char_no]}{Fore.LIGHTRED_EX}{line[char_no:]}{Fore.LIGHTYELLOW_EX}{lb}"
+            #     rf"{lb.join(lines_aft)}"
+            #     rf"{Fore.RESET}"
+            # )
+            # logger.error(f"\n{error_to_print}\n{lines_colored.lstrip(lb)}")
         match = re.search(r"at \[(\d+):(\d+)\]", str(error))
         return error_to_print
 
@@ -685,7 +696,9 @@ class BigQuery:
     ) -> pd.DataFrame:
         project = project or self.project
         if sql:
-            self._dry_run(sql)
+            dry_run_result = self._dry_run(sql)
+            if not dry_run_result.get("success", False):
+                return pd.DataFrame(dry_run_result)
             inner_q = f"({sql})"
             return self.q(rf" SELECT * FROM {inner_q} LIMIT 1 ").T
 
@@ -877,14 +890,7 @@ class BigQueryService:
         )
 
 
-def main():
+if __name__ == "__main__":
     bq = BigQuery(project="andrekamarudin")
 
-    return bq.q(
-        "SELECT * FROM `andrekamarudin.ura_ods.txn_clean` order by price desc, contract_date desc, floor",
-        sample_row_cnt=0,
-    )
-
-
-if __name__ == "__main__":
-    main()
+    bq.q("SELECT 1 as test")

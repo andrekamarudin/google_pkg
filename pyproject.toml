@@ -1,6 +1,6 @@
 [project]
 name = "google-api"
-version = "1.6.1"
+version = "1.8"
 description = "Package to interact with various Google APIs"
 authors = [{ name = "Andre", email = "andre.kamarudin@fairprice.com.sg" }]
 requires-python = ">=3.10,<4.0"
@@ -16,7 +16,6 @@ dependencies = [
     "pydantic>=2.0.0,<3.0.0",
     "tqdm>=4.0.0,<5.0.0",
     "db-dtypes>=1.1,<2",
-    "loguru>=0.0.0,<1.0.0",
     "colorama>=0.0.0,<1.0.0",
     "icecream>=2.1.3,<3",
     "python-dotenv>=1.0,<2",
@@ -26,6 +25,8 @@ dependencies = [
     "google-auth-oauthlib>=1.1",
     "returns>=0.25.0",
     "tabulate>=0.9.0",
+    "termcolor>=3.1.0",
+    "aklog",
 ]
 
 [dependency-groups]
@@ -34,3 +35,6 @@ dev = ["ipykernel>=6.29.5,<7"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.uv.sources]
+aklog = { git = "https://github.com/andrekamarudin/aklog" }
